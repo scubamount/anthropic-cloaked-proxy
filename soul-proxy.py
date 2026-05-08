@@ -77,7 +77,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # Capture gateway's system prompt (has dynamic memory/user context)
-        gateway_system = body.get("system", "")
+        raw_system = body.get("system", "")
+        if isinstance(raw_system, list) and raw_system:
+            # Modern Hermes sends system as an array of text blocks
+            parts = []
+            for block in raw_system:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            gateway_system = "\n".join(parts)
+        elif isinstance(raw_system, str):
+            gateway_system = raw_system
+        else:
+            gateway_system = ""
         
         # Build injection from gateway context + disk SOUL.md
         inject_block = _build_inject(gateway_system)
