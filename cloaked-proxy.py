@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermes → Anthropic OAuth Cloaking Proxy (v19 — auto-refresh OAuth, bounded errors)."""
+"""Hermes → Anthropic OAuth Cloaking Proxy (v20 — namespaced tool cloak, no collisions)."""
 
 import json
 import os
@@ -90,9 +90,49 @@ MODEL_CONTEXT = {
 
 _CC_FOR_HS = {}
 
+# --- v20: namespaced cloak ---------------------------------------------------
+# Each Hermes tool gets a unique cloaked name of the form
+# "<CC_NAME>__<hs_name>" so the upstream model sees the full toolset (no
+# silent collisions) while every name still starts with one of the 14 CC
+# tool names (preserves the cosmetic disguise).
+_NAMESPACE_SEP = "__"
+_CLOAKED_NAME_CACHE: dict = {}
+_UNCLOAK_CACHE: dict = {}
+
+
+def _validate_hs_name(hs_name: str) -> str:
+    if _NAMESPACE_SEP in hs_name:
+        raise ValueError(
+            f"hs_name {hs_name!r} contains reserved separator {_NAMESPACE_SEP!r}"
+        )
+    return hs_name
+
+
+def _cloaked_tool_name(hs_name: str) -> str:
+    if hs_name in _CLOAKED_NAME_CACHE:
+        return _CLOAKED_NAME_CACHE[hs_name]
+    _validate_hs_name(hs_name)
+    cc = _cc_for(hs_name)
+    cloaked = f"{cc}{_NAMESPACE_SEP}{hs_name}"
+    _CLOAKED_NAME_CACHE[hs_name] = cloaked
+    _UNCLOAK_CACHE[cloaked] = hs_name
+    return cloaked
+
+
+def _uncloak_tool_name(cloaked: str) -> str:
+    if cloaked in _UNCLOAK_CACHE:
+        return _UNCLOAK_CACHE[cloaked]
+    if _NAMESPACE_SEP in cloaked:
+        prefix, _sep, hs = cloaked.partition(_NAMESPACE_SEP)
+        if hs:
+            _UNCLOAK_CACHE[cloaked] = hs
+            _CLOAKED_NAME_CACHE.setdefault(hs, cloaked)
+            return hs
+    return cloaked
+
 
 def log(msg: str) -> None:
-    print(f"[cloaked-proxy v19] {msg}", file=sys.stderr, flush=True)
+    print(f"[cloaked-proxy v20] {msg}", file=sys.stderr, flush=True)
 
 
 def _cc_for(hs_name: str) -> str:
@@ -363,22 +403,26 @@ class Handler(BaseHTTPRequestHandler):
         tool_map = {}
         tools = body.get("tools", [])
         if tools:
-            seen = set()
             mapped = []
             for t in tools:
-                cc_name = _cc_for(t.get("name", ""))
-                if cc_name not in seen:
-                    seen.add(cc_name)
-                    tool_map[cc_name] = t.get("name", cc_name)
-                    schema = t.get("input_schema", {"type": "object"})
-                    if not isinstance(schema.get("properties"), dict):
-                        schema["properties"] = {}
-                    schema.setdefault("type", "object")
-                    mapped.append({
-                        "name": cc_name,
-                        "description": CC_DESC.get(cc_name, t.get("description", "")),
-                        "input_schema": schema,
-                    })
+                hs_name = t.get("name", "")
+                if not hs_name:
+                    continue
+                cloaked = _cloaked_tool_name(hs_name)
+                tool_map[cloaked] = hs_name
+                schema = t.get("input_schema", {"type": "object"})
+                if not isinstance(schema.get("properties"), dict):
+                    schema["properties"] = {}
+                schema.setdefault("type", "object")
+                cc = cloaked.split(_NAMESPACE_SEP, 1)[0]
+                mapped.append({
+                    "name": cloaked,
+                    # Keep the original Hermes description so the model knows
+                    # what each tool does. The cloak surface is in the *prefix*
+                    # of the cloaked name, not in the description.
+                    "description": t.get("description") or CC_DESC.get(cc, ""),
+                    "input_schema": schema,
+                })
             body["tools"] = mapped
             body["tool_choice"] = {"type": "auto"}
         else:
@@ -424,7 +468,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 decoded = chunk.decode(errors="replace")
-                for cn, hn in tool_map.items():
+                # Replace the longest cloaked name first so we don't match a
+                # shorter prefix that's a substring of a longer name.
+                for cn in sorted(tool_map, key=len, reverse=True):
+                    hn = tool_map[cn]
                     decoded = decoded.replace('"name":"' + cn + '"', '"name":"' + hn + '"')
                 self.wfile.write(decoded.encode())
                 self.wfile.flush()
@@ -444,8 +491,14 @@ class Handler(BaseHTTPRequestHandler):
 
         # Reverse-map tool names
         for block in result.get("content", []):
-            if block.get("type") == "tool_use" and block.get("name") in tool_map:
-                block["name"] = tool_map[block["name"]]
+            if block.get("type") == "tool_use":
+                cloaked = block.get("name", "")
+                if cloaked in tool_map:
+                    block["name"] = tool_map[cloaked]
+                else:
+                    # Structural fallback for any cloaked name we didn't
+                    # explicitly emit (e.g. model invented one).
+                    block["name"] = _uncloak_tool_name(cloaked)
 
         # Inject model context info into response
         model = result.get("model", "")
