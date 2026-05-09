@@ -18,7 +18,7 @@ from pathlib import Path
 API = "https://api.anthropic.com"
 CC_SYS = "You are Claude Code, Anthropic's official CLI for Claude."
 CC_H = {
-    "User-Agent": "claude-cli/2.1.77 (external, cli)",
+    "User-Agent": "claude-cli/2.1.133 (external, cli)",
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,token-counting-2024-11-01",
     "x-app": "cli",
@@ -378,11 +378,57 @@ class Handler(BaseHTTPRequestHandler):
         except UpstreamHTTPError as e:
             if e.code != 401:
                 raise
-            log("upstream returned 401; refreshing OAuth and retrying once")
-            if not TokenManager.refresh("upstream 401"):
-                raise
-            token = TokenManager.get_token()
-            return self._open_upstream_once(body, token)
+
+            # 401 handling: figure out whether this is a real expiry or
+            # something else. Refreshing on EVERY 401 produces a token-rotation
+            # storm — Anthropic invalidates each refresh's predecessor, so
+            # parallel threads using the older token cascade into more 401s,
+            # and Anthropic eventually flags the whole grant as compromised.
+            #
+            # Strategy:
+            #   1. If the in-memory token is genuinely past `expiresAt`, do
+            #      one refresh + retry (the historic happy path).
+            #   2. If the token still looks valid, the 401 is most likely a
+            #      transient edge / rate-limit hiccup. Reload the credentials
+            #      file (in case another process refreshed it) and retry the
+            #      same request once — but DO NOT trigger a Claude Code
+            #      refresh, which would mint yet another token and worsen
+            #      the storm.
+            with TokenManager._state_lock:
+                exp_ms = TokenManager._expires_at_ms
+            now_ms = time.time() * 1000
+            token_actually_expired = exp_ms and now_ms >= exp_ms
+
+            if token_actually_expired:
+                log("upstream returned 401 and token is past expiresAt; refreshing OAuth and retrying once")
+                if not TokenManager.refresh("upstream 401, token expired"):
+                    raise
+                token = TokenManager.get_token()
+                return self._open_upstream_once(body, token)
+
+            # Token still nominally valid — treat 401 as transient.
+            # Reload the credentials file in case a sibling process refreshed
+            # it, then retry once with whatever token is now on disk.
+            log("upstream returned 401 but token is not past expiresAt; reloading file + retrying once (no refresh)")
+            with TokenManager._state_lock:
+                try:
+                    TokenManager._load_locked(force=True)
+                except Exception:
+                    pass
+                token = TokenManager._token
+            try:
+                return self._open_upstream_once(body, token)
+            except UpstreamHTTPError as e2:
+                if e2.code != 401:
+                    raise
+                # Second 401 with a still-valid token — at this point a
+                # refresh is the only remaining lever. One refresh max per
+                # request, then surface the error if it persists.
+                log("second 401 after file reload; refreshing OAuth as last resort")
+                if not TokenManager.refresh("upstream 401 persisted after reload"):
+                    raise
+                token = TokenManager.get_token()
+                return self._open_upstream_once(body, token)
 
     def _prepare_body(self, body: dict) -> tuple[dict, dict]:
         # ---- Cloak ----
