@@ -179,20 +179,85 @@ class TokenManager:
 
     @classmethod
     def _read_credentials(cls) -> tuple[str, int, float]:
-        if not CRED_FILE.exists():
-            raise RuntimeError(f"credentials file not found: {CRED_FILE}")
-        data = json.loads(CRED_FILE.read_text())
-        oauth = data.get("claudeAiOauth") or data.get("claude_ai_oauth") or {}
-        token = oauth.get("accessToken") or oauth.get("access_token") or ""
-        expires_at = int(oauth.get("expiresAt") or oauth.get("expires_at") or 0)
-        if not token:
-            raise RuntimeError(f"empty access token in {CRED_FILE}")
-        return token, expires_at, CRED_FILE.stat().st_mtime
+        now_ms = int(time.time() * 1000)
+
+        # Collect candidate tokens from all sources with their expiry.
+        candidates: list[tuple[str, int]] = [] # (token, expires_at_ms)
+
+        # Source 1: credentials file (may not exist — Claude Code /login can
+        # delete it and move to Keychain-only storage)
+        f_token, f_expires = "", 0
+        if CRED_FILE.exists():
+            try:
+                data = json.loads(CRED_FILE.read_text())
+                oauth = data.get("claudeAiOauth") or data.get("claude_ai_oauth") or {}
+                f_token = oauth.get("accessToken") or oauth.get("access_token") or ""
+                f_expires = int(oauth.get("expiresAt") or oauth.get("expires_at") or 0)
+                if f_token:
+                    candidates.append((f_token, f_expires))
+            except Exception as exc:
+                log(f"credential file read failed: {type(exc).__name__}: {exc}")
+
+        # Source 2: macOS Keychain
+        k_token, k_expires = "", 0
+        if sys.platform == "darwin":
+            try:
+                result = subprocess.run(
+                    ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                keychain_data = json.loads(result.stdout)
+                k_oauth = keychain_data.get("claudeAiOauth") or keychain_data.get("claude_ai_oauth") or {}
+                k_token = k_oauth.get("accessToken") or k_oauth.get("access_token") or ""
+                k_expires = int(k_oauth.get("expiresAt") or k_oauth.get("expires_at") or 0)
+                if k_token:
+                    candidates.append((k_token, k_expires))
+            except Exception:
+                pass # Keychain unavailable is non-fatal
+
+        if not candidates:
+            raise RuntimeError(
+                f"no OAuth token found in {CRED_FILE} or macOS Keychain — "
+                f"run `claude /login` to refresh credentials"
+            )
+
+        # Prefer the token with the latest future expiry.
+        # This handles the case where one source has a stale expired token
+        # while the other has a freshly refreshed one.
+        def _score(tok_exp: tuple[str, int]) -> float:
+            tok, exp = tok_exp
+            if not exp:
+                return 0.0
+            remaining = (exp - now_ms) / 1000 # seconds left
+            return remaining
+
+        best_token, best_expires = max(candidates, key=_score)
+        if not best_token:
+            raise RuntimeError(
+                f"no valid OAuth token found in {CRED_FILE} or macOS Keychain"
+            )
+
+        src_label = "file" if best_token == f_token else "keychain"
+        remaining_min = int((best_expires / 1000) - time.time()) // 60 if best_expires else 0
+        if len(candidates) > 1:
+            log(f"credential sources: file={int((f_expires/1000)-time.time())//60 if f_expires else 'N/A'}m, "
+                f"keychain={int((k_expires/1000)-time.time())//60 if k_expires else 'N/A'}m → "
+                f"using {src_label} ({remaining_min}m)")
+
+        cred_mtime = CRED_FILE.stat().st_mtime if CRED_FILE.exists() else 0.0
+        return best_token, best_expires, cred_mtime
 
     @classmethod
     def _load_locked(cls, force: bool = False) -> str:
-        mtime = CRED_FILE.stat().st_mtime if CRED_FILE.exists() else 0.0
-        if force or cls._token is None or mtime != cls._cred_mtime:
+        file_exists = CRED_FILE.exists()
+        mtime = CRED_FILE.stat().st_mtime if file_exists else 0.0
+        # Reload when forced, first load, file changed, OR file deleted
+        # (mtime==0 and _cred_mtime!=0 means file was removed — Keychain-only now)
+        file_vanished = (not file_exists) and (cls._cred_mtime != 0.0)
+        if force or cls._token is None or mtime != cls._cred_mtime or file_vanished:
             cls._token, cls._expires_at_ms, cls._cred_mtime = cls._read_credentials()
             log(f"loaded OAuth token sha12={cls.token_sha12()} {cls.expiry_summary()}")
         return cls._token
