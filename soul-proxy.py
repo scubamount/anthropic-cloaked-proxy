@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import sys
+import datetime
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,7 +41,8 @@ if _SKILLS_NAMES:
 
 
 def log(msg: str) -> None:
-    print(f"[soul-proxy v3] {msg}", file=sys.stderr, flush=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} [soul-proxy v3] {msg}", file=sys.stderr, flush=True)
 
 
 def _build_inject(gateway_system):

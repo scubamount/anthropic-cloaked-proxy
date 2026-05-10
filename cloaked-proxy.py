@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import datetime
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -132,7 +133,8 @@ def _uncloak_tool_name(cloaked: str) -> str:
 
 
 def log(msg: str) -> None:
-    print(f"[cloaked-proxy v20] {msg}", file=sys.stderr, flush=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} [cloaked-proxy v20] {msg}", file=sys.stderr, flush=True)
 
 
 def _cc_for(hs_name: str) -> str:
