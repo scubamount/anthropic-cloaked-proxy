@@ -10,7 +10,6 @@ import subprocess
 import sys
 import threading
 import time
-import datetime
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,7 +18,7 @@ from pathlib import Path
 API = "https://api.anthropic.com"
 CC_SYS = "You are Claude Code, Anthropic's official CLI for Claude."
 CC_H = {
-    "User-Agent": "claude-cli/2.1.133 (external, cli)",
+    "User-Agent": "claude-cli/2.1.77 (external, cli)",
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,token-counting-2024-11-01",
     "x-app": "cli",
@@ -80,6 +79,7 @@ CC_DESC = {
 
 # Model context limits (from platform.claude.com/docs/en/about-claude/models/overview)
 MODEL_CONTEXT = {
+    "claude-opus-4-8": 1000000,
     "claude-opus-4-7": 1000000,
     "claude-opus-4-6": 200000,
     "claude-sonnet-4-6": 1000000,
@@ -133,8 +133,7 @@ def _uncloak_tool_name(cloaked: str) -> str:
 
 
 def log(msg: str) -> None:
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} [cloaked-proxy v20] {msg}", file=sys.stderr, flush=True)
+    print(f"[cloaked-proxy v20] {msg}", file=sys.stderr, flush=True)
 
 
 def _cc_for(hs_name: str) -> str:
@@ -181,20 +180,85 @@ class TokenManager:
 
     @classmethod
     def _read_credentials(cls) -> tuple[str, int, float]:
-        if not CRED_FILE.exists():
-            raise RuntimeError(f"credentials file not found: {CRED_FILE}")
-        data = json.loads(CRED_FILE.read_text())
-        oauth = data.get("claudeAiOauth") or data.get("claude_ai_oauth") or {}
-        token = oauth.get("accessToken") or oauth.get("access_token") or ""
-        expires_at = int(oauth.get("expiresAt") or oauth.get("expires_at") or 0)
-        if not token:
-            raise RuntimeError(f"empty access token in {CRED_FILE}")
-        return token, expires_at, CRED_FILE.stat().st_mtime
+        now_ms = int(time.time() * 1000)
+
+        # Collect candidate tokens from all sources with their expiry.
+        candidates: list[tuple[str, int]] = [] # (token, expires_at_ms)
+
+        # Source 1: credentials file (may not exist — Claude Code /login can
+        # delete it and move to Keychain-only storage)
+        f_token, f_expires = "", 0
+        if CRED_FILE.exists():
+            try:
+                data = json.loads(CRED_FILE.read_text())
+                oauth = data.get("claudeAiOauth") or data.get("claude_ai_oauth") or {}
+                f_token = oauth.get("accessToken") or oauth.get("access_token") or ""
+                f_expires = int(oauth.get("expiresAt") or oauth.get("expires_at") or 0)
+                if f_token:
+                    candidates.append((f_token, f_expires))
+            except Exception as exc:
+                log(f"credential file read failed: {type(exc).__name__}: {exc}")
+
+        # Source 2: macOS Keychain
+        k_token, k_expires = "", 0
+        if sys.platform == "darwin":
+            try:
+                result = subprocess.run(
+                    ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                keychain_data = json.loads(result.stdout)
+                k_oauth = keychain_data.get("claudeAiOauth") or keychain_data.get("claude_ai_oauth") or {}
+                k_token = k_oauth.get("accessToken") or k_oauth.get("access_token") or ""
+                k_expires = int(k_oauth.get("expiresAt") or k_oauth.get("expires_at") or 0)
+                if k_token:
+                    candidates.append((k_token, k_expires))
+            except Exception:
+                pass # Keychain unavailable is non-fatal
+
+        if not candidates:
+            raise RuntimeError(
+                f"no OAuth token found in {CRED_FILE} or macOS Keychain — "
+                f"run `claude /login` to refresh credentials"
+            )
+
+        # Prefer the token with the latest future expiry.
+        # This handles the case where one source has a stale expired token
+        # while the other has a freshly refreshed one.
+        def _score(tok_exp: tuple[str, int]) -> float:
+            tok, exp = tok_exp
+            if not exp:
+                return 0.0
+            remaining = (exp - now_ms) / 1000 # seconds left
+            return remaining
+
+        best_token, best_expires = max(candidates, key=_score)
+        if not best_token:
+            raise RuntimeError(
+                f"no valid OAuth token found in {CRED_FILE} or macOS Keychain"
+            )
+
+        src_label = "file" if best_token == f_token else "keychain"
+        remaining_min = int((best_expires / 1000) - time.time()) // 60 if best_expires else 0
+        if len(candidates) > 1:
+            log(f"credential sources: file={int((f_expires/1000)-time.time())//60 if f_expires else 'N/A'}m, "
+                f"keychain={int((k_expires/1000)-time.time())//60 if k_expires else 'N/A'}m → "
+                f"using {src_label} ({remaining_min}m)")
+
+        cred_mtime = CRED_FILE.stat().st_mtime if CRED_FILE.exists() else 0.0
+        return best_token, best_expires, cred_mtime
 
     @classmethod
     def _load_locked(cls, force: bool = False) -> str:
-        mtime = CRED_FILE.stat().st_mtime if CRED_FILE.exists() else 0.0
-        if force or cls._token is None or mtime != cls._cred_mtime:
+        file_exists = CRED_FILE.exists()
+        mtime = CRED_FILE.stat().st_mtime if file_exists else 0.0
+        # Reload when forced, first load, file changed, OR file deleted
+        # (mtime==0 and _cred_mtime!=0 means file was removed — Keychain-only now)
+        file_vanished = (not file_exists) and (cls._cred_mtime != 0.0)
+        if force or cls._token is None or mtime != cls._cred_mtime or file_vanished:
             cls._token, cls._expires_at_ms, cls._cred_mtime = cls._read_credentials()
             log(f"loaded OAuth token sha12={cls.token_sha12()} {cls.expiry_summary()}")
         return cls._token
@@ -247,7 +311,7 @@ class TokenManager:
                 cls._claude_bin(),
                 "-p",
                 "--model",
-                "opus",
+                "opus-4-8",
                 "--output-format",
                 "json",
                 "--no-session-persistence",
@@ -308,6 +372,22 @@ def flatten(content):
 def fix_message(msg):
     role = msg.get("role", "user")
     content = msg.get("content", "")
+
+    # OpenAI format: {"role": "tool", "content": "...", "tool_call_id": "..."}
+    # Claude expects tool results inside a user message with content blocks.
+    if role == "tool":
+        if isinstance(content, str):
+            result_content = content
+        elif isinstance(content, list):
+            result_content = flatten(content)
+        else:
+            result_content = str(content)
+        tool_id = msg.get("tool_call_id", "")
+        block = {"type": "tool_result", "content": result_content or "(empty)"}
+        if tool_id:
+            block["tool_use_id"] = tool_id
+        return {"role": "user", "content": [block]}
+
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
@@ -380,57 +460,11 @@ class Handler(BaseHTTPRequestHandler):
         except UpstreamHTTPError as e:
             if e.code != 401:
                 raise
-
-            # 401 handling: figure out whether this is a real expiry or
-            # something else. Refreshing on EVERY 401 produces a token-rotation
-            # storm — Anthropic invalidates each refresh's predecessor, so
-            # parallel threads using the older token cascade into more 401s,
-            # and Anthropic eventually flags the whole grant as compromised.
-            #
-            # Strategy:
-            #   1. If the in-memory token is genuinely past `expiresAt`, do
-            #      one refresh + retry (the historic happy path).
-            #   2. If the token still looks valid, the 401 is most likely a
-            #      transient edge / rate-limit hiccup. Reload the credentials
-            #      file (in case another process refreshed it) and retry the
-            #      same request once — but DO NOT trigger a Claude Code
-            #      refresh, which would mint yet another token and worsen
-            #      the storm.
-            with TokenManager._state_lock:
-                exp_ms = TokenManager._expires_at_ms
-            now_ms = time.time() * 1000
-            token_actually_expired = exp_ms and now_ms >= exp_ms
-
-            if token_actually_expired:
-                log("upstream returned 401 and token is past expiresAt; refreshing OAuth and retrying once")
-                if not TokenManager.refresh("upstream 401, token expired"):
-                    raise
-                token = TokenManager.get_token()
-                return self._open_upstream_once(body, token)
-
-            # Token still nominally valid — treat 401 as transient.
-            # Reload the credentials file in case a sibling process refreshed
-            # it, then retry once with whatever token is now on disk.
-            log("upstream returned 401 but token is not past expiresAt; reloading file + retrying once (no refresh)")
-            with TokenManager._state_lock:
-                try:
-                    TokenManager._load_locked(force=True)
-                except Exception:
-                    pass
-                token = TokenManager._token
-            try:
-                return self._open_upstream_once(body, token)
-            except UpstreamHTTPError as e2:
-                if e2.code != 401:
-                    raise
-                # Second 401 with a still-valid token — at this point a
-                # refresh is the only remaining lever. One refresh max per
-                # request, then surface the error if it persists.
-                log("second 401 after file reload; refreshing OAuth as last resort")
-                if not TokenManager.refresh("upstream 401 persisted after reload"):
-                    raise
-                token = TokenManager.get_token()
-                return self._open_upstream_once(body, token)
+            log("upstream returned 401; refreshing OAuth and retrying once")
+            if not TokenManager.refresh("upstream 401"):
+                raise
+            token = TokenManager.get_token()
+            return self._open_upstream_once(body, token)
 
     def _prepare_body(self, body: dict) -> tuple[dict, dict]:
         # ---- Cloak ----
@@ -476,6 +510,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             body.pop("tools", None)
         return body, tool_map
+
+    def do_GET(self):
+        """Stub /v1/models for provider model-list checks."""
+        if self.path.rstrip("/") in ("/v1/models", "/models"):
+            self._send_json(200, {
+                "object": "list",
+                "data": [{"id": "claude-opus-4-8", "object": "model", "owned_by": "anthropic"}],
+            })
+        else:
+            self._send_json_error(404, f"not found: {self.path}")
 
     def do_POST(self):
         try:

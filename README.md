@@ -4,9 +4,9 @@ Bypass Anthropic's "extra usage" subscription gate on Max/Pro plans by running H
 
 ```
 Hermes → Soul Proxy (:8319) → Cloaked Proxy (:8318) → Anthropic API
-         injects SOUL.md          tool mapping (28→14)
-         + skills list            CC fingerprint cloak
-         + memory context         OAuth auth
+        injects SOUL.md          tool mapping (28→14)
+        + skills list            CC fingerprint cloak
+        + memory context         OAuth auth
 ```
 
 ## Why two proxies
@@ -48,7 +48,7 @@ Point Hermes at the soul proxy:
 
 ```bash
 hermes config set model.provider anthropic
-hermes config set model.default claude-opus-4-7
+hermes config set model.default claude-opus-4-8
 hermes config set model.base_url "http://127.0.0.1:8319"
 hermes config set model.api_key "sk-dummy"
 ```
@@ -70,6 +70,7 @@ hermes chat -q "ls /home/nick/ | head -3"
 | `cloaked-proxy.py` | Tool mapping + Anthropic fingerprint cloak + OAuth headers |
 | `soul-proxy.py` | SOUL.md injection + skills list + gateway dynamic context |
 | `start_both.sh` | Restart script (kill old, start cloaked, start soul, verify) |
+| `tests/` | Unit tests for message conversion and proxy behavior |
 
 ## Architecture
 
@@ -89,12 +90,28 @@ Reads `~/.hermes/SOUL.md` from disk on startup. On each request:
 
 Pure cloak — **zero personality injection** (soul proxy handles that).
 
+#### OpenAI → Anthropic message conversion
+
+Hermes sends messages in OpenAI format. Claude's API requires Anthropic format. The cloaked proxy converts automatically:
+
+| OpenAI format | Anthropic format |
+|---------------|------------------|
+| `{"role": "tool", "content": "...", "tool_call_id": "t1"}` | `{"role": "user", "content": [{"type": "tool_result", "content": "...", "tool_use_id": "t1"}]}` |
+| `{"role": "assistant", "content": [{"type": "tool_use", ...}]}` | Passed through (native Anthropic format) |
+| `{"role": "user", "content": "..."}` | `{"role": "user", "content": "..."}` |
+
+This conversion happens in `fix_message()` and is required because Claude rejects `role: "tool"` with:
+```
+HTTP 400: Unexpected role "tool". Allowed roles are "user" or "assistant".
+```
+
 #### Model context awareness
 
 Context limits from [Anthropic docs](https://platform.claude.com/docs/en/about-claude/models/overview):
 
 | Model | Context | Max Output |
 |-------|---------|------------|
+| claude-opus-4-8 | **1M** | 128k |
 | claude-opus-4-7 | **1M** | 128k |
 | claude-opus-4-6 | 200k | 64k |
 | claude-sonnet-4-6 | **1M** | 64k |
@@ -153,43 +170,6 @@ Reverse mapping stores `TOOL_MAP = {cc_name: real_hermes_name}` — tool names a
 
 The model may naturally note the CC/Hermes name mismatch — accept it. Routing **is** correct.
 
-## Systemd units (optional)
-
-```ini
-# /etc/systemd/system/hermes-cloaked-proxy.service
-[Unit]
-Description=Hermes Cloaked Proxy (:8318)
-After=network-online.target
-
-[Service]
-Type=simple
-User=nick
-ExecStart=/usr/bin/python3 /home/nick/cloaked-proxy.py --port 8318
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# /etc/systemd/system/hermes-soul-proxy.service
-[Unit]
-Description=Hermes Soul Proxy (:8319)
-After=hermes-cloaked-proxy.service
-Requires=hermes-cloaked-proxy.service
-
-[Service]
-Type=simple
-User=nick
-ExecStart=/usr/bin/python3 /home/nick/soul-proxy.py --port 8319
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
 ## Troubleshooting
 
 ### "extra usage" or 429 errors
@@ -198,14 +178,14 @@ WantedBy=multi-user.target
 - System prompt must be exactly the CC one-liner
 - Clear rate limit after ~10-15 min of zero requests
 
+### Tool messages rejected (HTTP 400 "Unexpected role 'tool'")
+- Ensure you're running the latest `cloaked-proxy.py` with `fix_message()` OpenAI conversion
+- The proxy must convert `role: "tool"` messages to `role: "user"` with `type: "tool_result"` content blocks
+- Restart both proxies after updating: `bash ~/start_both.sh`
+
 ### Proxy dies after disconnect
 - Use `bash ~/start_both.sh` from within the VM (uses `nohup`)
 - Never inline SSH with `&` — Terminal tool blocks backgrounding
-
-## Current deployment
-
-- **Dev:** `hermes-dev` (10.0.30.103, PVE VM 109) — both proxies active, tested
-- **Prod target:** this production Hermes VM (10.0.30.149)
 
 ## License
 

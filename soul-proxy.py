@@ -6,7 +6,6 @@ import json
 import re
 import socket
 import sys
-import datetime
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,8 +40,7 @@ if _SKILLS_NAMES:
 
 
 def log(msg: str) -> None:
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} [soul-proxy v3] {msg}", file=sys.stderr, flush=True)
+    print(f"[soul-proxy v3] {msg}", file=sys.stderr, flush=True)
 
 
 def _build_inject(gateway_system):
@@ -145,6 +143,16 @@ class Handler(BaseHTTPRequestHandler):
         # Strip system prompt — cloaked proxy will set CC one-liner
         body.pop("system", None)
         return body
+
+    def do_GET(self):
+        """Stub /v1/models for provider model-list checks."""
+        if self.path.rstrip("/") in ("/v1/models", "/models"):
+            self._send_json(200, {
+                "object": "list",
+                "data": [{"id": "claude-opus-4-8", "object": "model", "owned_by": "anthropic"}],
+            })
+        else:
+            self._send_json_error(404, f"not found: {self.path}")
 
     def do_POST(self):
         body = self._parse_body()
