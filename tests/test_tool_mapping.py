@@ -65,13 +65,67 @@ def test_uncloak_unknown_with_separator_extracts_suffix():
     assert cp._uncloak_tool_name("Skill__some_new_tool") == "some_new_tool"
 
 
-def test_validate_hs_name_rejects_separator():
+def test_validate_hs_name_internal_separator_allowed():
+    # PR #2 — Hermes emits ``mcp__<server>_<tool>`` and ``mcp__<server>__<tool>``
+    # which legitimately contain ``__``. The validator must accept those; the
+    # cloak prefix ``<CC>__<canonical>`` is what Anthropic sees, so a single
+    # leading ``__`` is the only thing that would corrupt downstream.
+    cp._validate_hs_name("mcp__browser_back")
+    cp._validate_hs_name("mcp__server__tool")
+    cp._validate_hs_name("anything__with__double")
+
+
+def test_validate_hs_name_rejects_leading_separator():
     raised = False
     try:
-        cp._validate_hs_name("bad__name")
+        cp._validate_hs_name("__leading")
     except ValueError:
         raised = True
-    assert raised, "validator must reject names containing the separator"
+    assert raised, "validator must reject names with a leading separator"
+
+
+def test_validate_hs_name_rejects_empty():
+    raised = False
+    try:
+        cp._validate_hs_name("")
+    except ValueError:
+        raised = True
+    assert raised, "validator must reject empty names"
+
+
+def test_validate_hs_name_rejects_control_bytes():
+    raised = False
+    try:
+        cp._validate_hs_name("bad\x00name")
+    except ValueError:
+        raised = True
+    assert raised, "validator must reject control bytes"
+
+
+def test_prepare_body_dedups_colliding_cloaked_names():
+    """PR #2 — Anthropic returns HTTP 400 if two tools share a name.
+
+    The proxy must drop duplicates on the wire (first emission wins) while
+    still recording the alias into tool_map so response uncloaking works.
+    """
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"name": "browser_back", "description": "go back",
+             "input_schema": {"type": "object", "properties": {}}},
+            # Different canonical input, after mcp__ strip and `^(browser_)`
+            # regex match, ends up with the same cloaked name as the first.
+            # (We have to reach the same canonical; one way is to register
+            # the same hs_name twice verbatim — which the validator permits.)
+            {"name": "browser_back", "description": "dup",
+             "input_schema": {"type": "object", "properties": {}}},
+        ],
+    }
+    handler = cp.Handler.__new__(cp.Handler)
+    out, tool_map = handler._prepare_body(dict(body))
+    assert len(out["tools"]) == 1, (
+        f"expected 1 deduped entry, got {len(out['tools'])}: {out['tools']}"
+    )
 
 
 def test_prepare_body_keeps_all_tools():
