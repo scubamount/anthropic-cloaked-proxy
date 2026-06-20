@@ -102,10 +102,27 @@ _UNCLOAK_CACHE: dict = {}
 
 
 def _validate_hs_name(hs_name: str) -> str:
-    if _NAMESPACE_SEP in hs_name:
+    """Sanity-check a Hermes tool name.
+
+    Historically this rejected any name containing ``__`` because the cloak uses
+    ``__`` as the namespace separator (``<CC>__<tool>``). However, Claude Code
+    namespaces MCP servers as ``mcp__<server>__<tool>`` and Hermes occasionally
+    flattens that to ``mcp__<server>_<tool>`` (a single ``__`` at the start).
+    Both forms are valid on the wire — the cloaked-name builder passes them
+    through ``_cc_for`` (which strip-prefixes ``mcp_`` and tries each regex) and
+    the resulting ``<CC>__<canonical>`` form is what reaches Anthropic, so the
+    internal ``__`` never appears downstream. The failsafe that remains: ban a
+    LEADING ``__`` (would produce an empty CC name) and control bytes.
+    """
+    if not hs_name:
+        raise ValueError("hs_name must be a non-empty string")
+    if hs_name.startswith(_NAMESPACE_SEP):
         raise ValueError(
-            f"hs_name {hs_name!r} contains reserved separator {_NAMESPACE_SEP!r}"
+            f"hs_name {hs_name!r} starts with reserved separator {_NAMESPACE_SEP!r}"
         )
+    for ch in hs_name:
+        if ord(ch) < 0x20 or ch == "\x7f":
+            raise ValueError(f"hs_name {hs_name!r} contains control bytes")
     return hs_name
 
 
@@ -139,7 +156,13 @@ def log(msg: str) -> None:
 def _cc_for(hs_name: str) -> str:
     if hs_name in _CC_FOR_HS:
         return _CC_FOR_HS[hs_name]
-    clean = hs_name.removeprefix("mcp_")
+    # Strip ONE well-formed CC namespace prefix: ``mcp__`` (two underscores
+    # after ``mcp``). Claude Code namespaces MCP servers as
+    # ``mcp__<server>__<tool>`` and Hermes occasionally flattens that to
+    # ``mcp__<server>_<tool>`` (a single ``__`` at the start). Both reduce to
+    # the same canonical tool tail, which is what the regexes match against.
+    # If the prefix is missing (bare ``browser_back``) the strip is a no-op.
+    clean = hs_name.removeprefix("mcp__")
     for cc, pat in _MAPPING:
         if re.match(pat, clean):
             _CC_FOR_HS[hs_name] = cc
@@ -483,6 +506,7 @@ class Handler(BaseHTTPRequestHandler):
         body["messages"] = msgs
 
         tool_map = {}
+        seen_cloaked = set()
         tools = body.get("tools", [])
         if tools:
             mapped = []
@@ -491,6 +515,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not hs_name:
                     continue
                 cloaked = _cloaked_tool_name(hs_name)
+                if cloaked in seen_cloaked:
+                    # Anthropic returns HTTP 400 if two tools share a name.
+                    # Hermes' toolset registration can emit the same logical
+                    # tool under multiple names that collapse to one cloaked
+                    # name (e.g. once via a flat `browser_back` and again via
+                    # `mcp__browser_back` if both prefixes survive the tool
+                    # filter — or any future ``mcp__<server>_<tool>`` alias
+                    # whose canonical collides with an existing entry).
+                    # Keep the FIRST occurrence; still record the alias so
+                    # response uncloaking always finds a hermes-side name.
+                    tool_map.setdefault(cloaked, hs_name)
+                    continue
+                seen_cloaked.add(cloaked)
                 tool_map[cloaked] = hs_name
                 schema = t.get("input_schema", {"type": "object"})
                 if not isinstance(schema.get("properties"), dict):
