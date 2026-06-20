@@ -149,6 +149,65 @@ def _uncloak_tool_name(cloaked: str) -> str:
     return cloaked
 
 
+# --- Tool-arg type coercion -------------------------------------------------
+# Claude (esp. Opus 4 via the OAuth/CC path) sometimes emits tool_use.input
+# values as JSON strings even when input_schema declares a non-string type
+# (e.g. offset="480" instead of 480, or a stringified array/object). The real
+# Claude Code CLI coerces these silently; strict downstream validators (opencode)
+# reject them. We coerce on the response path using each tool's input_schema.
+_NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
+
+
+def _schema_types(spec: dict) -> list:
+    t = spec.get("type")
+    if isinstance(t, str):
+        return [t]
+    if isinstance(t, list):
+        return [x for x in t if isinstance(x, str)]
+    return []
+
+
+def coerce_tool_args(input_dict, schema) -> None:
+    """In-place coerce string args to the type declared in schema.properties.
+
+    Only acts when the value is a str and the schema is unambiguous. Numeric
+    strings -> int/float (no scientific notation, bounded length to avoid
+    surprising bigint coercion). Stringified JSON -> object/array via json.loads.
+    Everything else is left untouched.
+    """
+    if not isinstance(input_dict, dict) or not isinstance(schema, dict):
+        return
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return
+    for k, v in list(input_dict.items()):
+        if not isinstance(v, str) or k not in props:
+            continue
+        types = _schema_types(props[k])
+        if not types:
+            continue
+        if "integer" in types and _NUM_RE.match(v) and "." not in v and len(v) <= 18:
+            try:
+                input_dict[k] = int(v)
+                continue
+            except ValueError:
+                pass
+        if "number" in types and _NUM_RE.match(v) and len(v) <= 18:
+            try:
+                input_dict[k] = float(v)
+                continue
+            except ValueError:
+                pass
+        if ("boolean" in types) and v in ("true", "false"):
+            input_dict[k] = (v == "true")
+            continue
+        if ("object" in types and v.startswith("{")) or ("array" in types and v.startswith("[")):
+            try:
+                input_dict[k] = json.loads(v)
+            except (ValueError, json.JSONDecodeError):
+                pass
+
+
 def log(msg: str) -> None:
     print(f"[cloaked-proxy v20] {msg}", file=sys.stderr, flush=True)
 
@@ -489,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
             token = TokenManager.get_token()
             return self._open_upstream_once(body, token)
 
-    def _prepare_body(self, body: dict) -> tuple[dict, dict]:
+    def _prepare_body(self, body: dict) -> tuple[dict, dict, dict]:
         # ---- Cloak ----
         body["system"] = CC_SYS
         banned = ("thinking", "temperature", "top_p", "top_k",
@@ -506,6 +565,7 @@ class Handler(BaseHTTPRequestHandler):
         body["messages"] = msgs
 
         tool_map = {}
+        tool_schemas = {}
         seen_cloaked = set()
         tools = body.get("tools", [])
         if tools:
@@ -533,6 +593,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(schema.get("properties"), dict):
                     schema["properties"] = {}
                 schema.setdefault("type", "object")
+                tool_schemas[cloaked] = schema
                 cc = cloaked.split(_NAMESPACE_SEP, 1)[0]
                 mapped.append({
                     "name": cloaked,
@@ -546,7 +607,7 @@ class Handler(BaseHTTPRequestHandler):
             body["tool_choice"] = {"type": "auto"}
         else:
             body.pop("tools", None)
-        return body, tool_map
+        return body, tool_map, tool_schemas
 
     def do_GET(self):
         """Stub /v1/models for provider model-list checks."""
@@ -567,14 +628,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         want_stream = bool(body.get("stream", False))
-        body, tool_map = self._prepare_body(body)
+        body, tool_map, tool_schemas = self._prepare_body(body)
+        # Force non-streaming upstream so tool-arg coercion runs on a complete
+        # JSON body; re-synthesize SSE downstream if the client asked to stream.
+        body["stream"] = False
 
         try:
             with self._open_upstream_with_auth_retry(body) as resp:
-                if want_stream:
-                    self._send_stream_response(resp, tool_map)
-                else:
-                    self._send_message_response(resp, tool_map)
+                self._send_message_response(resp, tool_map, tool_schemas, as_sse=want_stream)
         except UpstreamHTTPError as e:
             self._send_json(e.code, e.body, e.headers.get("Content-Type", "application/json"))
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
@@ -585,29 +646,8 @@ class Handler(BaseHTTPRequestHandler):
             log(f"unexpected request failure: {type(exc).__name__}: {exc}")
             self._send_json_error(500, "cloaked proxy internal error", "proxy_error", f"{type(exc).__name__}: {exc}")
 
-    def _send_stream_response(self, resp, tool_map: dict):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        try:
-            while True:
-                chunk = resp.read(16384)
-                if not chunk:
-                    break
-                decoded = chunk.decode(errors="replace")
-                # Replace the longest cloaked name first so we don't match a
-                # shorter prefix that's a substring of a longer name.
-                for cn in sorted(tool_map, key=len, reverse=True):
-                    hn = tool_map[cn]
-                    decoded = decoded.replace('"name":"' + cn + '"', '"name":"' + hn + '"')
-                self.wfile.write(decoded.encode())
-                self.wfile.flush()
-        except (BrokenPipeError, OSError):
-            pass
-
-    def _send_message_response(self, resp, tool_map: dict):
+    def _send_message_response(self, resp, tool_map: dict, tool_schemas: dict | None = None, as_sse: bool = False):
+        tool_schemas = tool_schemas or {}
         data = resp.read()
         if not data:
             self._send_json_error(502, "empty upstream response", "upstream_error")
@@ -618,7 +658,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json_error(502, "invalid upstream JSON", "upstream_error", str(exc))
             return
 
-        # Reverse-map tool names
         for block in result.get("content", []):
             if block.get("type") == "tool_use":
                 cloaked = block.get("name", "")
@@ -628,14 +667,54 @@ class Handler(BaseHTTPRequestHandler):
                     # Structural fallback for any cloaked name we didn't
                     # explicitly emit (e.g. model invented one).
                     block["name"] = _uncloak_tool_name(cloaked)
+                coerce_tool_args(block.get("input"), tool_schemas.get(cloaked))
 
-        # Inject model context info into response
         model = result.get("model", "")
         ctx = MODEL_CONTEXT.get(model, 200000)
         result["_model_context"] = ctx
         result["_hermes_note"] = f"Model: {model} ({ctx//1000}k context)"
 
-        self._send_json(200, result)
+        if as_sse:
+            self._emit_message_as_sse(result)
+        else:
+            self._send_json(200, result)
+
+    def _emit_message_as_sse(self, result: dict):
+        # Synthesize an Anthropic-style SSE stream from a complete message so a
+        # streaming client gets the coerced (non-stream) body. Whole content
+        # blocks are sent at once rather than token-by-token.
+        def sse(event: str, payload: dict) -> bytes:
+            return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            content = result.get("content", [])
+            start_msg = {k: v for k, v in result.items() if k != "content"}
+            start_msg["content"] = []
+            self.wfile.write(sse("message_start", {"type": "message_start", "message": start_msg}))
+
+            for idx, block in enumerate(content):
+                btype = block.get("type")
+                if btype == "text":
+                    self.wfile.write(sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}}))
+                    self.wfile.write(sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")}}))
+                elif btype == "tool_use":
+                    self.wfile.write(sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "tool_use", "id": block.get("id", ""), "name": block.get("name", ""), "input": {}}}))
+                    self.wfile.write(sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": json.dumps(block.get("input", {}))}}))
+                else:
+                    self.wfile.write(sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": block}))
+                self.wfile.write(sse("content_block_stop", {"type": "content_block_stop", "index": idx}))
+
+            self.wfile.write(sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": result.get("stop_reason"), "stop_sequence": result.get("stop_sequence")}, "usage": result.get("usage", {})}))
+            self.wfile.write(sse("message_stop", {"type": "message_stop"}))
+            self.wfile.flush()
+        except (BrokenPipeError, OSError):
+            pass
 
 
 if __name__ == "__main__":
