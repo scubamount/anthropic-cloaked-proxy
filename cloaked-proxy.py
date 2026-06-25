@@ -683,6 +683,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_message_response(self, resp, tool_map: dict, tool_schemas: dict | None = None, as_sse: bool = False):
         tool_schemas = tool_schemas or {}
+        # The upstream model does not always echo the cloaked tool name we
+        # sent (e.g. it returns bare ``read`` when we declared ``Skill__read``).
+        # Build a hermes-side-name -> schema index so schema lookup succeeds
+        # regardless of whether the model replied with the cloaked or the
+        # uncloaked name. Without this, coercion is silently skipped and
+        # stringified numerics (offset="505") reach strict clients (OpenCode).
+        schemas_by_hs = {}
+        for _ck, _hs in tool_map.items():
+            _sc = tool_schemas.get(_ck)
+            if _sc is not None:
+                schemas_by_hs.setdefault(_hs, _sc)
         data = resp.read()
         if not data:
             self._send_json_error(502, "empty upstream response", "upstream_error")
@@ -702,7 +713,19 @@ class Handler(BaseHTTPRequestHandler):
                     # Structural fallback for any cloaked name we didn't
                     # explicitly emit (e.g. model invented one).
                     block["name"] = _uncloak_tool_name(cloaked)
-                coerce_tool_args(block.get("input"), tool_schemas.get(cloaked))
+                _before = json.dumps(block.get("input")) if os.environ.get("CLOAK_TRACE") else None
+                # Resolve schema by cloaked key first; if the model replied with
+                # the bare hermes-side name (cloaked not in tool_schemas), fall
+                # back to the hs-name index so coercion still runs.
+                _schema = tool_schemas.get(cloaked)
+                if _schema is None:
+                    _schema = schemas_by_hs.get(block.get("name"))
+                coerce_tool_args(block.get("input"), _schema)
+                if os.environ.get("CLOAK_TRACE"):
+                    _props = (_schema or {}).get("properties", {})
+                    log("TRACE tool=%s cloaked=%s schema_found=%s props=%s before=%s after=%s as_sse=%s"
+                        % (block.get("name"), cloaked, _schema is not None,
+                           json.dumps(_props), _before, json.dumps(block.get("input")), as_sse))
 
         model = result.get("model", "")
         ctx = MODEL_CONTEXT.get(model, 200000)
