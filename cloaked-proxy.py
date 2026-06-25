@@ -159,12 +159,31 @@ _NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
 
 def _schema_types(spec: dict) -> list:
+    """Collect the JSON-Schema scalar types declared for a property.
+
+    Handles the plain ``type`` (str or list) plus the union wrappers that
+    Zod/TypeBox-style generators (e.g. OpenCode's tool schemas) emit for
+    optional params — ``anyOf`` / ``oneOf`` / ``allOf`` — including the common
+    ``{"anyOf": [{"type": "number"}, {"type": "null"}]}`` nullable shape. Without
+    this, a stringified ``offset="660"`` against an ``anyOf`` numeric schema was
+    left uncoerced and rejected by the strict client-side validator.
+    """
+    if not isinstance(spec, dict):
+        return []
+    out = []
     t = spec.get("type")
     if isinstance(t, str):
-        return [t]
-    if isinstance(t, list):
-        return [x for x in t if isinstance(x, str)]
-    return []
+        out.append(t)
+    elif isinstance(t, list):
+        out.extend(x for x in t if isinstance(x, str))
+    for key in ("anyOf", "oneOf", "allOf"):
+        sub = spec.get(key)
+        if isinstance(sub, list):
+            for member in sub:
+                out.extend(_schema_types(member))
+    # Dedup, preserve order.
+    seen = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
 
 
 def coerce_tool_args(input_dict, schema) -> None:

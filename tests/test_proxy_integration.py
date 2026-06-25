@@ -122,6 +122,41 @@ def test_coerce_tool_args_leaves_strings_and_unknown_keys():
     assert args["untracked"] == "999", "unknown key must be left untouched"
 
 
+def test_coerce_tool_args_anyof_nullable_number():
+    """Regression: OpenCode-style schemas wrap optional numerics in anyOf.
+
+    Symptom before the fix: read tool's offset/limit declared as
+    {"anyOf": [{"type": "number"}, {"type": "null"}]}; Opus emitted
+    offset="660" (stringified); _schema_types returned [] so the value was
+    left as a string and OpenCode's strict validator rejected it
+    ("The schema wants a number type" / "schema serialization issue with offset").
+    """
+    if not hasattr(cloaked, "coerce_tool_args"):
+        pytest.skip("coerce_tool_args unavailable in this proxy version")
+    schema = {"type": "object", "properties": {
+        "offset": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+        "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "ratio": {"oneOf": [{"type": "number"}, {"type": "string"}]},
+    }}
+    args = {"offset": "660", "limit": "20", "ratio": "1.5"}
+    cloaked.coerce_tool_args(args, schema)
+    assert args["offset"] == 660.0 and isinstance(args["offset"], float)
+    assert args["limit"] == 20 and isinstance(args["limit"], int)
+    assert args["ratio"] == 1.5 and isinstance(args["ratio"], float)
+
+
+def test_schema_types_collects_union_members():
+    if not hasattr(cloaked, "_schema_types"):
+        pytest.skip("_schema_types unavailable in this proxy version")
+    assert cloaked._schema_types({"type": "integer"}) == ["integer"]
+    assert set(cloaked._schema_types({"type": ["number", "null"]})) == {"number", "null"}
+    assert "number" in cloaked._schema_types(
+        {"anyOf": [{"type": "number"}, {"type": "null"}]})
+    assert "integer" in cloaked._schema_types(
+        {"oneOf": [{"type": "integer"}, {"type": "string"}]})
+    assert cloaked._schema_types({}) == []
+
+
 # -----------------------------------------------------------------------------
 # /v1/models shape — both cloaked and soul proxies must return the same set.
 # -----------------------------------------------------------------------------
