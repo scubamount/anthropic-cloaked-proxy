@@ -157,6 +157,46 @@ def test_schema_types_collects_union_members():
     assert cloaked._schema_types({}) == []
 
 
+def test_coerce_tool_args_infers_when_schema_typeless():
+    """Regression: opaque/typeless schema must still coerce numeric strings.
+
+    OpenCode's read tool declares offset/limit in a shape the proxy can't read
+    (no parseable JSON-Schema type). Before the infer fallback, _schema_types
+    returned [] and offset="1144" passed through as a string, tripping
+    OpenCode's validator: SchemaError(Expected number | undefined, got "1144").
+    Infer mode coerces a cleanly-numeric string when the schema does NOT
+    explicitly type the field as string.
+    """
+    if not hasattr(cloaked, "coerce_tool_args"):
+        pytest.skip("coerce_tool_args unavailable in this proxy version")
+    # Property present but with an unreadable type wrapper -> _schema_types == []
+    schema = {"type": "object", "properties": {
+        "offset": {"description": "byte offset", "x-weird": True},
+        "limit": {"description": "max bytes"},
+    }}
+    args = {"offset": "1144", "limit": "189"}
+    cloaked.coerce_tool_args(args, schema)
+    assert args["offset"] == 1144 and isinstance(args["offset"], int)
+    assert args["limit"] == 189 and isinstance(args["limit"], int)
+
+
+def test_coerce_tool_args_infer_preserves_genuine_strings():
+    if not hasattr(cloaked, "coerce_tool_args"):
+        pytest.skip("coerce_tool_args unavailable in this proxy version")
+    schema = {"type": "object", "properties": {
+        "name": {"type": "string"},          # explicitly string -> never coerce
+        "zip": {"description": "no type"},    # infer mode, leading zero -> keep
+        "path": {"description": "no type"},   # infer mode, non-numeric -> keep
+        "count": {"description": "no type"},  # infer mode, clean int -> coerce
+    }}
+    args = {"name": "1144", "zip": "02134", "path": "scripts/x.py", "count": "7"}
+    cloaked.coerce_tool_args(args, schema)
+    assert args["name"] == "1144", "explicit string field must not coerce"
+    assert args["zip"] == "02134", "leading-zero numeric must stay a string (id/zip)"
+    assert args["path"] == "scripts/x.py", "non-numeric string untouched"
+    assert args["count"] == 7 and isinstance(args["count"], int)
+
+
 # -----------------------------------------------------------------------------
 # /v1/models shape — both cloaked and soul proxies must return the same set.
 # -----------------------------------------------------------------------------

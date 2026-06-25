@@ -203,24 +203,40 @@ def coerce_tool_args(input_dict, schema) -> None:
         if not isinstance(v, str) or k not in props:
             continue
         types = _schema_types(props[k])
-        if not types:
+        # When the schema declares no parseable type for this property (e.g. a
+        # generator emitted a shape _schema_types can't read, or omitted the
+        # type entirely), fall back to value-shape inference: a string that is
+        # cleanly numeric/bool/JSON is coerced UNLESS the schema explicitly says
+        # the field is a string. This is what makes stringified offset="1144"
+        # against an opaque OpenCode read-tool schema coerce correctly without
+        # the proxy having to recognize every JSON-Schema dialect.
+        infer = not types
+        if "string" in types and len(types) == 1:
+            # Genuinely a string field — never coerce.
             continue
-        if "integer" in types and _NUM_RE.match(v) and "." not in v and len(v) <= 18:
+        # In infer mode (no schema type), be conservative: skip numeric strings
+        # with a leading zero (e.g. "02134" zip codes, ids) since dropping the
+        # zero would corrupt an identifier. Schema-typed numerics still coerce.
+        infer_numeric_ok = not (len(v) > 1 and v.lstrip("-").startswith("0") and "." not in v)
+        if ("integer" in types or (infer and infer_numeric_ok and _NUM_RE.match(v) and "." not in v)) \
+                and _NUM_RE.match(v) and "." not in v and len(v) <= 18:
             try:
                 input_dict[k] = int(v)
                 continue
             except ValueError:
                 pass
-        if "number" in types and _NUM_RE.match(v) and len(v) <= 18:
+        if ("number" in types or (infer and infer_numeric_ok and _NUM_RE.match(v))) \
+                and _NUM_RE.match(v) and len(v) <= 18:
             try:
                 input_dict[k] = float(v)
                 continue
             except ValueError:
                 pass
-        if ("boolean" in types) and v in ("true", "false"):
+        if ("boolean" in types or infer) and v in ("true", "false"):
             input_dict[k] = (v == "true")
             continue
-        if ("object" in types and v.startswith("{")) or ("array" in types and v.startswith("[")):
+        if ("object" in types and v.startswith("{")) or ("array" in types and v.startswith("[")) \
+                or (infer and (v.startswith("{") or v.startswith("["))):
             try:
                 input_dict[k] = json.loads(v)
             except (ValueError, json.JSONDecodeError):
