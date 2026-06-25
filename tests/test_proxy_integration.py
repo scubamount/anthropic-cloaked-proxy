@@ -197,6 +197,56 @@ def test_coerce_tool_args_infer_preserves_genuine_strings():
     assert args["count"] == 7 and isinstance(args["count"], int)
 
 
+def test_schema_resolves_by_hs_name_when_model_returns_bare_name():
+    """Regression: model may echo the BARE hermes-side tool name.
+
+    We declare the tool to the upstream model under its cloaked name
+    (e.g. ``Skill__read``) and key tool_schemas by that cloaked name. But
+    the model does not always echo it -- OpenCode subagent runs showed the
+    model returning bare ``read``. The response handler used to resolve the
+    coercion schema with tool_schemas.get(cloaked) ONLY, so for a bare-name
+    return the lookup missed (schema_found=False) and coerce_tool_args was
+    skipped entirely -- offset="505"/limit="170" reached OpenCode's Zod
+    validator as strings: SchemaError(Expected number | undefined, got "170").
+
+    The fix builds a hermes-side-name -> schema index and falls back to it.
+    This test reproduces that resolution + the resulting coercion.
+    """
+    if not hasattr(cloaked, "coerce_tool_args"):
+        pytest.skip("coerce_tool_args unavailable in this proxy version")
+
+    read_schema = {"type": "object", "properties": {
+        "filePath": {"type": "string"},
+        "offset": {"description": "line offset"},   # typeless -> infer path
+        "limit": {"description": "max lines"},       # typeless -> infer path
+    }}
+    # As built in _prepare_body: keyed by the CLOAKED name.
+    tool_map = {"Skill__read": "read"}
+    tool_schemas = {"Skill__read": read_schema}
+
+    # Mirror _send_message_response's hs-name index.
+    schemas_by_hs = {}
+    for _ck, _hs in tool_map.items():
+        _sc = tool_schemas.get(_ck)
+        if _sc is not None:
+            schemas_by_hs.setdefault(_hs, _sc)
+
+    # Model returned the BARE name -> cloaked-key lookup MUST miss.
+    cloaked_name = "read"
+    assert tool_schemas.get(cloaked_name) is None, "bare name must miss the cloaked index"
+
+    # Handler remaps block name then resolves schema; for a bare return the
+    # remapped name is still 'read' (uncloak no-op).
+    resolved = tool_schemas.get(cloaked_name) or schemas_by_hs.get("read")
+    assert resolved is read_schema, "fallback must resolve schema by hs-name"
+
+    args = {"filePath": "scripts/x.py", "offset": "505", "limit": "170"}
+    cloaked.coerce_tool_args(args, resolved)
+    assert args["offset"] == 505 and isinstance(args["offset"], int)
+    assert args["limit"] == 170 and isinstance(args["limit"], int)
+    assert args["filePath"] == "scripts/x.py"
+
+
 # -----------------------------------------------------------------------------
 # /v1/models shape — both cloaked and soul proxies must return the same set.
 # -----------------------------------------------------------------------------
