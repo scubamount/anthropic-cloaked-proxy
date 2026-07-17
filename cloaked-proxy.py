@@ -80,6 +80,7 @@ CC_DESC = {
 # Model context limits (from platform.claude.com/docs/en/about-claude/models/overview)
 MODEL_CONTEXT = {
     "claude-opus-4-8": 1000000,
+    "claude-fable-5": 1000000,
     "claude-opus-4-7": 1000000,
     "claude-opus-4-6": 200000,
     "claude-sonnet-4-6": 1000000,
@@ -88,6 +89,16 @@ MODEL_CONTEXT = {
     "claude-haiku-4-5": 200000,
     "claude-haiku-4-5-20251001": 200000,
 }
+
+# Models advertised via GET /v1/models (drives the Hermes model picker).
+# Curated subset of MODEL_CONTEXT — the ids we actually want selectable, in
+# display order. Both proxies' do_GET iterate this, so it's the single source.
+LISTED_MODELS = (
+    "claude-opus-4-8",
+    "claude-fable-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5-20250929",
+)
 
 _CC_FOR_HS = {}
 
@@ -649,7 +660,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self._send_json(200, {
                 "object": "list",
-                "data": [{"id": "claude-opus-4-8", "object": "model", "owned_by": "anthropic"}],
+                "data": [
+                    {"id": mid, "object": "model", "owned_by": "anthropic"}
+                    for mid in LISTED_MODELS
+                ],
             })
         else:
             self._send_json_error(404, f"not found: {self.path}")

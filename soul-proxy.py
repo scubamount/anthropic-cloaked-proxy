@@ -15,6 +15,16 @@ DOWNSTREAM = "http://127.0.0.1:8318/v1/messages"
 SOUL_FILE = Path.home() / ".hermes" / "SOUL.md"
 DOWNSTREAM_TIMEOUT = 190
 
+# Models advertised via GET /v1/models. MUST mirror cloaked-proxy.LISTED_MODELS;
+# duplicated as a literal because soul-proxy can't import the hyphenated
+# cloaked-proxy.py module. test_proxy_integration.py asserts the two match.
+LISTED_MODELS = (
+    "claude-opus-4-8",
+    "claude-fable-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5-20250929",
+)
+
 # Read SOUL.md from disk (stays fresh)
 if SOUL_FILE.exists():
     HERMES_SOUL = SOUL_FILE.read_text().strip()
@@ -155,7 +165,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self._send_json(200, {
                 "object": "list",
-                "data": [{"id": "claude-opus-4-8", "object": "model", "owned_by": "anthropic"}],
+                "data": [
+                    {"id": mid, "object": "model", "owned_by": "anthropic"}
+                    for mid in LISTED_MODELS
+                ],
             })
         else:
             self._send_json_error(404, f"not found: {self.path}")

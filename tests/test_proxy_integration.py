@@ -5,10 +5,10 @@ semantics) with:
 
 - ``test_fix_message_tool_role`` — OpenAI ``role:"tool"`` → Anthropic
   tool_result block (PR-openclaw/cloaked-proxy#1).
-- ``test_do_models_response_shape`` — ``/v1/models`` returned from a dry-run
-  handler invocation matches ``MODEL_CONTEXT`` and is in the order the
-  cloaked-proxy stub expects.
-- ``test_soul_models_response_shape`` — same shape on the soul proxy.
+- ``test_do_models_response_shape`` — ``/v1/models`` advertises
+  ``LISTED_MODELS`` and every listed id has a ``MODEL_CONTEXT`` entry.
+- ``test_soul_models_match_cloaked`` — soul and cloaked LISTED_MODELS agree.
+- ``test_soul_models_response_shape`` — soul proxy has a ``/v1/models`` stub.
 - ``test_prepare_body_dedups_colliding_cloaked_names`` (moved to
   test_tool_mapping.py) — Anthropic HTTP 400 protection.
 - ``test_token_picker_prefers_future_expiry`` — multi-source token
@@ -251,30 +251,27 @@ def test_schema_resolves_by_hs_name_when_model_returns_bare_name():
 # /v1/models shape — both cloaked and soul proxies must return the same set.
 # -----------------------------------------------------------------------------
 def test_do_models_response_shape():
-    """Build the data inline and assert it covers the proxy MODEL_CONTEXT."""
-    if not hasattr(cloaked, "MODEL_CONTEXT"):
-        pytest.skip("MODEL_CONTEXT unavailable")
-    # Replicate the dry-run assertion from upstream test_tool_mapping.py plus
-    # the live set ordering: claude-opus-4-8 first, then the others.
-    expected_first = "claude-opus-4-8"
-    model_context = cloaked.MODEL_CONTEXT
+    """do_GET advertises LISTED_MODELS; every listed id has a MODEL_CONTEXT entry."""
+    if not hasattr(cloaked, "LISTED_MODELS"):
+        pytest.skip("LISTED_MODELS unavailable")
+    listed = cloaked.LISTED_MODELS
+    assert len(listed) > 0, "LISTED_MODELS is empty"
+    assert "claude-opus-4-8" in listed, "opus retired from picker?"
+    assert "claude-fable-5" in listed, "fable missing from picker"
+    assert any(m.startswith("claude-sonnet") for m in listed), "no sonnet in picker"
+    # Every advertised model must have a context-limit entry (picker + ctx note
+    # stay consistent).
+    for mid in listed:
+        assert mid in cloaked.MODEL_CONTEXT, f"{mid} advertised but absent from MODEL_CONTEXT"
 
-    # Re-derive what do_GET emits (its actual code only reads MODEL_CONTEXT).
-    data = [
-        {"id": k, "object": "model", "owned_by": "anthropic"}
-        for k in model_context.keys()
-    ]
-    assert len(data) > 0, "MODEL_CONTEXT is empty"
-    # We don't enforce position-0 == claude-opus-4-8 here because the upstream
-    # ``do_GET`` doesn't sort; it just iterates dict-preserving insertion order
-    # which happens to put claude-opus-4-8 first in MODEL_CONTEXT. Test the
-    # set membership instead.
-    ids = {d["id"] for d in data}
-    for must in ("claude-opus-4-8",):
-        assert must in ids, f"{must} missing — was the model retired?"
-    # The proxy must NOT advertise a model not in MODEL_CONTEXT (consistency).
-    # (do_GET reads from MODEL_CONTEXT, so this is tautological — but if
-    # someone changes do_GET to read from elsewhere, this catches it.)
+
+def test_soul_models_match_cloaked():
+    """soul-proxy's LISTED_MODELS literal must mirror cloaked's (duplicated by necessity)."""
+    if not hasattr(soul, "LISTED_MODELS") or not hasattr(cloaked, "LISTED_MODELS"):
+        pytest.skip("LISTED_MODELS unavailable on one proxy")
+    assert tuple(soul.LISTED_MODELS) == tuple(cloaked.LISTED_MODELS), (
+        "soul and cloaked /v1/models drifted — update both LISTED_MODELS literals"
+    )
 
 
 def test_soul_models_response_shape():
