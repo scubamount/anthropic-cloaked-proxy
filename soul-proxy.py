@@ -51,6 +51,12 @@ def _build_inject(gateway_system):
     """
     # Find transition: SOUL.md ends with "You live by this soul." or similar
     # Then everything after is dynamic context (memory, user profile, etc.)
+    # ponytail: this regex NOT matching live SOUL.md is load-bearing — it keeps
+    # dynamic_text empty, so the inject block stays byte-stable across turns and
+    # Anthropic prefix-cache holds. If you ever add "You live by this soul." to
+    # SOUL.md, the dynamic block turns ON and WILL bust prompt cache every turn
+    # unless that block is itself turn-stable (no timestamps/counters). Verify
+    # before enabling.
     transition = re.search(r'(You live by this soul\.)', gateway_system)
 
     dynamic_text = ""
