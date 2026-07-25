@@ -1,6 +1,6 @@
 # Anthropic Cloaked Proxy for Hermes
 
-Bypass Anthropic's "extra usage" subscription gate on Max/Pro plans by running Hermes Agent through a Claude Code OAuth fingerprint. Uses a two-proxy chain so personality, skills, and tools all work natively.
+Run Hermes Agent through a Claude Code OAuth fingerprint. Uses a two-proxy chain so personality, skills, and tools all work natively.
 
 ```
 Hermes → Soul Proxy (:8319) → Cloaked Proxy (:8318) → Anthropic API
@@ -215,4 +215,4 @@ The model may naturally note the CC/Hermes name mismatch — accept it. Routing 
 
 ## License
 
-MIT — use at your own risk. Anthropic ToS may frown on this.
+MIT — use at your own risk.
