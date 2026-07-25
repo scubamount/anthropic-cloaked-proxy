@@ -32,26 +32,31 @@ claude login
 
 ## Deploy proxies
 
-Copy the three files to your Hermes host:
+Copy the three files to your Hermes host (they live in `~/proxies/` on the
+current install):
 
 ```bash
-scp cloaked-proxy.py soul-proxy.py start_both.sh nick@your-host:/home/nick/
+scp cloaked-proxy.py soul-proxy.py start_both.sh you@your-host:~/proxies/
 ```
 
 Start both:
 
 ```bash
-bash ~/start_both.sh
+bash ~/proxies/start_both.sh
 ```
 
 Point Hermes at the soul proxy:
 
 ```bash
 hermes config set model.provider anthropic
-hermes config set model.default claude-opus-4-8
+hermes config set model.default claude-opus-5
 hermes config set model.base_url "http://127.0.0.1:8319"
-hermes config set model.api_key "sk-dummy"
+hermes config set model.api_key ""
 ```
+
+`api_key` is intentionally empty — the cloaked proxy supplies OAuth
+credentials upstream, and a non-empty value here sends a conflicting
+`Authorization` header.
 
 ## Test
 
@@ -60,7 +65,15 @@ hermes config set model.api_key "sk-dummy"
 hermes chat -q "Without using any tools or skills, what can you see are available from your system prompt."
 
 # Tool execution check
-hermes chat -q "ls /home/nick/ | head -3"
+hermes chat -q "ls ~ | head -3"
+```
+
+Run the test suite (needs the interpreter pytest is installed under; unset
+`PYTHONPATH` so a venv on the path doesn't shadow it):
+
+```bash
+cd ~/proxies && env -u PYTHONPATH python3 -m pytest tests/ -q      # 25 passed, 1 skipped
+cd ~/proxies && env -u PYTHONPATH python3 -m pytest tests/ -q --live   # + live roundtrip
 ```
 
 ## Files
@@ -111,12 +124,19 @@ Context limits from [Anthropic docs](https://platform.claude.com/docs/en/about-c
 
 | Model | Context | Max Output |
 |-------|---------|------------|
+| claude-opus-5 | **1M** | 128k |
 | claude-opus-4-8 | **1M** | 128k |
+| claude-fable-5 | **1M** | 128k |
 | claude-opus-4-7 | **1M** | 128k |
 | claude-opus-4-6 | 200k | 64k |
 | claude-sonnet-4-6 | **1M** | 64k |
 | claude-sonnet-4-20250514 | 200k | 64k |
+| claude-sonnet-4-5-20250929 | 200k | 64k |
+| claude-haiku-4-5 | 200k | 64k |
 | claude-haiku-4-5-20251001 | 200k | 64k |
+
+Table must match `MODEL_CONTEXT` in `cloaked-proxy.py`. Models offered in the
+`/v1/models` picker are `LISTED_MODELS` (a subset, picker order).
 
 Unknown models default to 200k. The proxy injects `_model_context` and `_hermes_note` into API responses.
 
@@ -173,7 +193,9 @@ The model may naturally note the CC/Hermes name mismatch — accept it. Routing 
 ## Troubleshooting
 
 ### "extra usage" or 429 errors
-- Verify both proxies: `ss -tlnp | grep -E '831[89]'`
+- Verify both proxies are listening:
+  - macOS: `lsof -nP -iTCP:8318,8319 -sTCP:LISTEN`
+  - Linux: `ss -tlnp | grep -E '831[89]'`
 - Check Hermes base_url points to 8319 (soul): `hermes config | grep base_url`
 - System prompt must be exactly the CC one-liner
 - Clear rate limit after ~10-15 min of zero requests
@@ -181,11 +203,15 @@ The model may naturally note the CC/Hermes name mismatch — accept it. Routing 
 ### Tool messages rejected (HTTP 400 "Unexpected role 'tool'")
 - Ensure you're running the latest `cloaked-proxy.py` with `fix_message()` OpenAI conversion
 - The proxy must convert `role: "tool"` messages to `role: "user"` with `type: "tool_result"` content blocks
-- Restart both proxies after updating: `bash ~/start_both.sh`
+- Restart both proxies after updating: `bash ~/proxies/start_both.sh`
 
 ### Proxy dies after disconnect
-- Use `bash ~/start_both.sh` from within the VM (uses `nohup`)
+- Use `bash ~/proxies/start_both.sh` from within the VM (uses `nohup`)
 - Never inline SSH with `&` — Terminal tool blocks backgrounding
+
+### `no option named '--live'` when running tests
+- Fixed: `pytest_addoption` must live in `tests/conftest.py`. pytest ignores it
+  in a plain test module, which errored the live roundtrip test on every run.
 
 ## License
 

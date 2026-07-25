@@ -363,10 +363,3 @@ def test_live_mcp_browser_roundtrip():
     except urllib.error.HTTPError as exc:
         detail = exc.read(300).decode(errors="replace")
         pytest.fail(f"HTTP {exc.code}: {detail}")
-
-
-def pytest_addoption(parser):
-    parser.addoption(
-        "--live", action="store_true", default=False,
-        help="include the live HTTP roundtrip test (costs ~10 input tokens)"
-    )
