@@ -19,6 +19,7 @@ DOWNSTREAM_TIMEOUT = 190
 # duplicated as a literal because soul-proxy can't import the hyphenated
 # cloaked-proxy.py module. test_proxy_integration.py asserts the two match.
 LISTED_MODELS = (
+    "claude-opus-5",
     "claude-opus-4-8",
     "claude-fable-5",
     "claude-sonnet-4-6",

@@ -79,6 +79,7 @@ CC_DESC = {
 
 # Model context limits (from platform.claude.com/docs/en/about-claude/models/overview)
 MODEL_CONTEXT = {
+    "claude-opus-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-fable-5": 1000000,
     "claude-opus-4-7": 1000000,
@@ -94,6 +95,7 @@ MODEL_CONTEXT = {
 # Curated subset of MODEL_CONTEXT — the ids we actually want selectable, in
 # display order. Both proxies' do_GET iterate this, so it's the single source.
 LISTED_MODELS = (
+    "claude-opus-5",
     "claude-opus-4-8",
     "claude-fable-5",
     "claude-sonnet-4-6",
