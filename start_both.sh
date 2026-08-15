@@ -4,6 +4,9 @@
 
 set -u
 
+PROXY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLOAKED_SCRIPT="$PROXY_DIR/cloaked-proxy.py"
+SOUL_SCRIPT="$PROXY_DIR/soul-proxy.py"
 CLOAKED_PORT=8318
 SOUL_PORT=8319
 PROXY_LOG="/tmp/proxy.log"
@@ -36,7 +39,13 @@ find_claude() {
 
 port_listening() {
   local port="$1"
-  [[ -n "$(ss -H -ltn "( sport = :$port )" 2>/dev/null || true)" ]]
+  # Linux has `ss` (iproute2); macOS has only `lsof`/`netstat`. Prefer `ss`
+  # when present, fall back to `lsof` (the macOS default path).
+  if command -v ss >/dev/null 2>&1; then
+    [[ -n "$(ss -H -ltn "( sport = :$port )" 2>/dev/null || true)" ]]
+  else
+    [[ -n "$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)" ]]
+  fi
 }
 
 wait_port() {
@@ -59,8 +68,8 @@ stop_proxies() {
     fuser -k "${SOUL_PORT}/tcp" >/dev/null 2>&1 || true
     fuser -k "${CLOAKED_PORT}/tcp" >/dev/null 2>&1 || true
   else
-    pkill -f "/home/nick/soul-proxy.py --port ${SOUL_PORT}" >/dev/null 2>&1 || true
-    pkill -f "/home/nick/cloaked-proxy.py --port ${CLOAKED_PORT}" >/dev/null 2>&1 || true
+    pkill -f "$SOUL_SCRIPT --port ${SOUL_PORT}" >/dev/null 2>&1 || true
+    pkill -f "$CLOAKED_SCRIPT --port ${CLOAKED_PORT}" >/dev/null 2>&1 || true
   fi
   sleep 1
 }
@@ -86,12 +95,13 @@ refresh_claude_token() {
   local reason="$1"
   log "refreshing Claude OAuth via Claude Code (${reason})..."
   python3 - "$CLAUDE_BIN_RESOLVED" <<'PY'
-import subprocess, sys
+import os, subprocess, sys
 claude = sys.argv[1]
+model = os.environ.get('CLOAKED_REFRESH_MODEL', 'opus-4-8')
 cmd = [
     claude,
     '-p',
-    '--model', 'opus',
+    '--model', model,
     '--output-format', 'json',
     '--no-session-persistence',
     'Reply with exactly OK.',
@@ -144,7 +154,7 @@ start_proxies() {
   : > "$SOUL_LOG"
 
   log "starting cloaked proxy :${CLOAKED_PORT}..."
-  nohup python3 /home/nick/cloaked-proxy.py --port "$CLOAKED_PORT" > "$PROXY_LOG" 2>&1 &
+  nohup python3 "$CLOAKED_SCRIPT" --port "$CLOAKED_PORT" > "$PROXY_LOG" 2>&1 &
   CLOAKED_PID=$!
   wait_port "$CLOAKED_PORT" "cloaked proxy" || {
     log "cloaked proxy failed to listen; recent log follows"
@@ -158,7 +168,7 @@ start_proxies() {
   fi
 
   log "starting soul proxy :${SOUL_PORT}..."
-  nohup python3 /home/nick/soul-proxy.py --port "$SOUL_PORT" > "$SOUL_LOG" 2>&1 &
+  nohup python3 "$SOUL_SCRIPT" --port "$SOUL_PORT" > "$SOUL_LOG" 2>&1 &
   SOUL_PID=$!
   wait_port "$SOUL_PORT" "soul proxy" || {
     log "soul proxy failed to listen; recent log follows"
@@ -210,7 +220,6 @@ PY
 
 main() {
   need_cmd python3
-  need_cmd ss
   CLAUDE_BIN_RESOLVED="$(find_claude)" || die "Claude Code CLI not found"
   export CLAUDE_BIN_RESOLVED
   log "using Claude CLI: $CLAUDE_BIN_RESOLVED"

@@ -259,10 +259,33 @@ def test_do_models_response_shape():
     assert "claude-opus-4-8" in listed, "opus retired from picker?"
     assert "claude-fable-5" in listed, "fable missing from picker"
     assert any(m.startswith("claude-sonnet") for m in listed), "no sonnet in picker"
+    # haiku is a real, cheap model Anthropic offers — it must be pickable so
+    # cheap delegation doesn't force the user to hand-write the id.
+    assert "claude-haiku-4-5" in listed, "haiku missing from picker"
     # Every advertised model must have a context-limit entry (picker + ctx note
     # stay consistent).
     for mid in listed:
         assert mid in cloaked.MODEL_CONTEXT, f"{mid} advertised but absent from MODEL_CONTEXT"
+
+
+def test_model_context_accuracy():
+    """MODEL_CONTEXT must match known-good Anthropic context limits.
+
+    A stale ctx leaks into the injected _hermes_note/_model_context metadata
+    and reads as authoritative. Two historical drifts are pinned here so a
+    future bad edit fails loudly instead of silently:
+      - claude-opus-4-6 is 1M (was wrongly 200K).
+      - claude-opus-4-5 (200K) must exist as a compatibility fallback.
+    """
+    if not hasattr(cloaked, "MODEL_CONTEXT"):
+        pytest.skip("MODEL_CONTEXT unavailable")
+    ctx = cloaked.MODEL_CONTEXT
+    assert ctx.get("claude-opus-4-6") == 1000000, (
+        f"opus-4-6 ctx={ctx.get('claude-opus-4-6')} — should be 1M (was wrongly 200K)"
+    )
+    assert ctx.get("claude-opus-4-5") == 200000, (
+        "claude-opus-4-5 (200K) missing from MODEL_CONTEXT compatibility set"
+    )
 
 
 def test_soul_models_match_cloaked():

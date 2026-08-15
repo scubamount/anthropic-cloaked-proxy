@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermes → Anthropic OAuth Cloaking Proxy (v20 — namespaced tool cloak, no collisions)."""
+"""Hermes → Anthropic OAuth Cloaking Proxy (v21 — namespaced tool cloak, no collisions)."""
 
 import json
 import os
@@ -26,6 +26,10 @@ CC_H = {
 UPSTREAM_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_UPSTREAM_TIMEOUT", "180"))
 REFRESH_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_REFRESH_TIMEOUT", "120"))
 EXPIRY_REFRESH_MARGIN_SEC = int(os.environ.get("CLOAKED_PROXY_EXPIRY_MARGIN_SEC", "600"))
+# Model the OAuth-refresh probe asks Claude Code to use. This is a hidden pin:
+# if Anthropic ever retires the pinned model, token refresh silently breaks.
+# Override with CLOAKED_REFRESH_MODEL (must be a valid Claude Code model id).
+REFRESH_MODEL = os.environ.get("CLOAKED_REFRESH_MODEL", "opus-4-8")
 
 # Semantic grouping: 28 Hermes tools → 14 CC names
 _MAPPING = [
@@ -83,7 +87,8 @@ MODEL_CONTEXT = {
     "claude-opus-4-8": 1000000,
     "claude-fable-5": 1000000,
     "claude-opus-4-7": 1000000,
-    "claude-opus-4-6": 200000,
+    "claude-opus-4-6": 1000000,
+    "claude-opus-4-5": 200000,
     "claude-sonnet-4-6": 1000000,
     "claude-sonnet-4-20250514": 200000,
     "claude-sonnet-4-5-20250929": 200000,
@@ -100,6 +105,7 @@ LISTED_MODELS = (
     "claude-fable-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5",
 )
 
 _CC_FOR_HS = {}
@@ -257,7 +263,7 @@ def coerce_tool_args(input_dict, schema) -> None:
 
 
 def log(msg: str) -> None:
-    print(f"[cloaked-proxy v20] {msg}", file=sys.stderr, flush=True)
+    print(f"[cloaked-proxy v21] {msg}", file=sys.stderr, flush=True)
 
 
 def _cc_for(hs_name: str) -> str:
@@ -441,7 +447,7 @@ class TokenManager:
                 cls._claude_bin(),
                 "-p",
                 "--model",
-                "opus-4-8",
+                REFRESH_MODEL,
                 "--output-format",
                 "json",
                 "--no-session-persistence",

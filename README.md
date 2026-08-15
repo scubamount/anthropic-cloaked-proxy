@@ -128,7 +128,8 @@ Context limits from [Anthropic docs](https://platform.claude.com/docs/en/about-c
 | claude-opus-4-8 | **1M** | 128k |
 | claude-fable-5 | **1M** | 128k |
 | claude-opus-4-7 | **1M** | 128k |
-| claude-opus-4-6 | 200k | 64k |
+| claude-opus-4-6 | **1M** | 64k |
+| claude-opus-4-5 | 200k | 64k |
 | claude-sonnet-4-6 | **1M** | 64k |
 | claude-sonnet-4-20250514 | 200k | 64k |
 | claude-sonnet-4-5-20250929 | 200k | 64k |
