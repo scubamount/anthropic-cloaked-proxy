@@ -189,7 +189,7 @@ health_check() {
   out="$(python3 - <<'PY'
 import http.client, json, time
 payload = {
-    'model': 'claude-opus-4-7',
+    'model': 'claude-opus-4-8',
     'max_tokens': 8,
     'messages': [{'role': 'user', 'content': 'Reply with exactly OK.'}],
     'stream': False,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermes Soul Proxy v3 — captures gateway system prompt + SOUL.md, injects into messages.
+"""Hermes Soul Proxy v4 — captures gateway system prompt + SOUL.md, injects into messages.
    Routes: Hermes Gateway → this (:8319) → cloaked proxy (:8318) → Anthropic"""
 
 import json
@@ -27,32 +27,72 @@ LISTED_MODELS = (
     "claude-haiku-4-5",
 )
 
-# Read SOUL.md from disk (stays fresh)
-if SOUL_FILE.exists():
-    HERMES_SOUL = SOUL_FILE.read_text().strip()
-else:
-    HERMES_SOUL = "# Hermes Agent Persona\nYou are Hermes. Caveman brain. Nick's general agent."
+# Read SOUL.md from disk — refreshed when mtime changes so edits take effect
+# without a daemon restart (import-time snapshot went stale silently).
+SOUL_FILE_MTIME = 0.0
+HERMES_SOUL = ""
 
-# Skills list
-SKILLS_DIR = Path.home() / ".hermes" / "skills"
-_SKILLS_NAMES = []
-if SKILLS_DIR.exists():
-    for sf in sorted(SKILLS_DIR.glob("**/SKILL.md")):
+def _soul_text() -> str:
+    """Return current SOUL.md content, re-reading when the file changes.
+
+    Import-time snapshots went stale silently — a SOUL.md edit required a
+    daemon restart to take effect. mtime comparison is cheap (one stat per
+    request) and keeps the inject block byte-stable across turns in the
+    steady state, so Anthropic prefix-cache still holds.
+    """
+    global SOUL_FILE_MTIME, HERMES_SOUL
+    try:
+        mtime = SOUL_FILE.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if mtime != SOUL_FILE_MTIME:
         try:
-            m = re.search(r'^name:\s*(.+)$', sf.read_text(), re.MULTILINE)
-            if m:
-                _SKILLS_NAMES.append(m.group(1).strip())
-        except Exception:
-            pass
+            HERMES_SOUL = SOUL_FILE.read_text().strip()
+            SOUL_FILE_MTIME = mtime
+        except OSError:
+            pass  # keep last good content on transient read failure
+    return HERMES_SOUL or (
+        "# Hermes Agent Persona\nYou are Hermes. Caveman brain. Nick's general agent."
+    )
 
+
+# Skills list — refreshed when the skills tree changes (dir mtime bumps on
+# add/remove; re-glob only then, so steady state stays byte-stable for the
+# prefix cache). A new skill used to require a daemon restart to appear.
+SKILLS_DIR = Path.home() / ".hermes" / "skills"
+SKILLS_MTIME = 0.0
+_SKILLS_NAMES = []
 _SKILLS_BLOCK = ""
-if _SKILLS_NAMES:
-    lines = ["- " + n for n in _SKILLS_NAMES]
-    _SKILLS_BLOCK = "<available_skills>\n" + "\n".join(lines) + "\n</available_skills>"
+
+
+def _skills_block() -> str:
+    global SKILLS_MTIME, _SKILLS_NAMES, _SKILLS_BLOCK
+    try:
+        mtime = SKILLS_DIR.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if mtime != SKILLS_MTIME:
+        names = []
+        if SKILLS_DIR.exists():
+            for sf in sorted(SKILLS_DIR.glob("**/SKILL.md")):
+                try:
+                    m = re.search(r'^name:\s*(.+)$', sf.read_text(), re.MULTILINE)
+                    if m:
+                        names.append(m.group(1).strip())
+                except Exception:
+                    pass
+        _SKILLS_NAMES = names
+        if names:
+            lines = ["- " + n for n in names]
+            _SKILLS_BLOCK = "<available_skills>\n" + "\n".join(lines) + "\n</available_skills>"
+        else:
+            _SKILLS_BLOCK = ""
+        SKILLS_MTIME = mtime
+    return _SKILLS_BLOCK
 
 
 def log(msg: str) -> None:
-    print(f"[soul-proxy v3] {msg}", file=sys.stderr, flush=True)
+    print(f"[soul-proxy v4] {msg}", file=sys.stderr, flush=True)
 
 
 def _build_inject(gateway_system):
@@ -83,11 +123,11 @@ def _build_inject(gateway_system):
 
     # Build final injection
     inject = (
-        "<hermes_persona>\n" + HERMES_SOUL + "\n</hermes_persona>\n\n"
+        "<hermes_persona>\n" + _soul_text() + "\n</hermes_persona>\n\n"
     )
     if dynamic_text:
         inject += dynamic_text + "\n\n"
-    inject += _SKILLS_BLOCK
+    inject += _skills_block()
     inject += "\n\n**You are Hermes. Follow the persona above. Be caveman. Talk like Hermes.**\n"
     inject += "**Load skills with skill_view(name) when task matches.**\n"
 
@@ -229,6 +269,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[1] == "--port" else 8319
     log(f":{port} → {DOWNSTREAM}")
+    _skills_block()  # prime the cache so the count below is real, not 0
     log(f"{len(_SKILLS_NAMES)} skills, captures gateway dynamic context")
     log("threaded, bounded downstream errors, stream passthrough enabled")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

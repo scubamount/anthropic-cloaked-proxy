@@ -308,6 +308,70 @@ def test_soul_models_response_shape():
         pytest.fail("soul.Handler has no do_GET — /v1/models stub is missing")
 
 
+def test_soul_refreshes_soul_md_on_mtime_change():
+    """SOUL.md edits must take effect without a daemon restart.
+
+    The first implementation snapshotted HERMES_SOUL at import time; a
+    SOUL.md edit required restarting the soul proxy, and the comment
+    claimed 'stays fresh'. _soul_text() must return the NEW content once
+    the file's mtime changes.
+    """
+    if not hasattr(soul, "_soul_text"):
+        pytest.skip("_soul_text unavailable in this proxy version")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "SOUL.md"
+        f.write_text("# v1\nold persona", encoding="utf-8")
+        old_file = soul.SOUL_FILE
+        old_mtime, old_text = soul.SOUL_FILE_MTIME, soul.HERMES_SOUL
+        try:
+            soul.SOUL_FILE = f
+            soul.SOUL_FILE_MTIME = 0.0
+            soul.HERMES_SOUL = ""
+            first = soul._soul_text()
+            assert "old persona" in first, f"first read wrong: {first!r}"
+
+            # Touch with new content — same path, new mtime.
+            f.write_text("# v2\nnew persona", encoding="utf-8")
+            second = soul._soul_text()
+            assert "new persona" in second, (
+                f"SOUL.md edit not picked up without restart: {second!r}"
+            )
+        finally:
+            soul.SOUL_FILE = old_file
+            soul.SOUL_FILE_MTIME = old_mtime
+            soul.HERMES_SOUL = old_text
+
+
+def test_soul_skills_block_refreshes_on_tree_change():
+    """New skills must appear in the injected block without a restart."""
+    if not hasattr(soul, "_skills_block"):
+        pytest.skip("_skills_block unavailable in this proxy version")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "alpha").mkdir()
+        (d / "alpha" / "SKILL.md").write_text("---\nname: alpha-skill\n---\n", encoding="utf-8")
+        old_dir, old_mtime = soul.SKILLS_DIR, soul.SKILLS_MTIME
+        try:
+            soul.SKILLS_DIR = d
+            soul.SKILLS_MTIME = 0.0
+            block1 = soul._skills_block()
+            assert "alpha-skill" in block1, f"first block missing skill: {block1!r}"
+
+            (d / "beta").mkdir()
+            (d / "beta" / "SKILL.md").write_text("---\nname: beta-skill\n---\n", encoding="utf-8")
+            block2 = soul._skills_block()
+            assert "beta-skill" in block2, (
+                f"new skill not picked up without restart: {block2!r}"
+            )
+        finally:
+            soul.SKILLS_DIR = old_dir
+            soul.SKILLS_MTIME = old_mtime
+
+
 # -----------------------------------------------------------------------------
 # Token picker — multi-source merge prefers latest-future-expiry.
 # -----------------------------------------------------------------------------

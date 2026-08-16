@@ -72,7 +72,7 @@ Run the test suite (needs the interpreter pytest is installed under; unset
 `PYTHONPATH` so a venv on the path doesn't shadow it):
 
 ```bash
-cd ~/proxies && env -u PYTHONPATH python3 -m pytest tests/ -q      # 25 passed, 1 skipped
+cd ~/proxies && env -u PYTHONPATH python3 -m pytest tests/ -q      # 28 passed, 1 skipped
 cd ~/proxies && env -u PYTHONPATH python3 -m pytest tests/ -q --live   # + live roundtrip
 ```
 
@@ -89,7 +89,8 @@ cd ~/proxies && env -u PYTHONPATH python3 -m pytest tests/ -q --live   # + live 
 
 ### Soul Proxy (port 8319)
 
-Reads `~/.hermes/SOUL.md` from disk on startup. On each request:
+Reads `~/.hermes/SOUL.md` from disk (re-read when the file's mtime changes —
+no restart needed for persona edits). On each request:
 
 1. Captures gateway's system prompt (contains `MEMORY` + `USER PROFILE`)
 2. Finds the `SOUL.md` boundary (`"You live by this soul."`) and extracts everything after it as dynamic context
