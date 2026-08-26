@@ -26,10 +26,17 @@ CC_H = {
 UPSTREAM_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_UPSTREAM_TIMEOUT", "180"))
 REFRESH_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_REFRESH_TIMEOUT", "120"))
 EXPIRY_REFRESH_MARGIN_SEC = int(os.environ.get("CLOAKED_PROXY_EXPIRY_MARGIN_SEC", "600"))
-# Model the OAuth-refresh probe asks Claude Code to use. This is a hidden pin:
-# if Anthropic ever retires the pinned model, token refresh silently breaks.
-# Override with CLOAKED_REFRESH_MODEL (must be a valid Claude Code model id).
-REFRESH_MODEL = os.environ.get("CLOAKED_REFRESH_MODEL", "opus-4-8")
+# Model the OAuth-refresh probe asks Claude Code to use.
+#
+# MUST be a Claude Code *alias* ("opus", "sonnet", "haiku"), never a versioned
+# id. A versioned pin is a time bomb: `opus-4-8` was the default here and the
+# CLI rejected it with api_error_status=404 ("It may not exist or you may not
+# have access to it") on 41/41 refresh attempts — every OAuth refresh this
+# proxy attempted had been failing, silently, because the request still
+# succeeded on the token Claude Code happened to refresh on its own schedule.
+# Aliases always resolve to a current model, which is the whole point of them.
+# Override with CLOAKED_REFRESH_MODEL.
+REFRESH_MODEL = os.environ.get("CLOAKED_REFRESH_MODEL", "opus")
 
 # Semantic grouping: 28 Hermes tools → 14 CC names
 _MAPPING = [
@@ -425,7 +432,14 @@ class TokenManager:
             token = cls._load_locked(force=False)
             if cls._expires_soon_locked():
                 log(f"OAuth token {cls.expiry_summary()}; refreshing before request")
-                cls.refresh("expires soon")
+                # Discarding this bool is how a wholly broken refresh path stayed
+                # invisible for 41/41 attempts: the request still succeeded on a
+                # token Claude Code had refreshed on its own, so nothing ever
+                # surfaced. A failed refresh is now loud.
+                if not cls.refresh("expires soon"):
+                    log("WARNING: OAuth refresh FAILED; continuing on existing "
+                        "token — it may expire mid-request. Check CLOAKED_REFRESH_MODEL "
+                        f"(currently {REFRESH_MODEL!r}) is a valid Claude Code alias.")
                 token = cls._load_locked(force=True)
             return token
 

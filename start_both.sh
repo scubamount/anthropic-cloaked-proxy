@@ -97,7 +97,8 @@ refresh_claude_token() {
   python3 - "$CLAUDE_BIN_RESOLVED" <<'PY'
 import os, subprocess, sys
 claude = sys.argv[1]
-model = os.environ.get('CLOAKED_REFRESH_MODEL', 'opus-4-8')
+# Alias, never a versioned id — see REFRESH_MODEL in cloaked-proxy.py.
+model = os.environ.get('CLOAKED_REFRESH_MODEL', 'opus')
 cmd = [
     claude,
     '-p',

@@ -1,5 +1,6 @@
 """Unit tests for cloaked-proxy tool name mapping (no-collision fix)."""
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -175,6 +176,26 @@ def test_prepare_body_preserves_input_schema():
     assert "image_url" in out_schema["properties"]
     assert "question" in out_schema["properties"]
     assert out_schema["required"] == ["image_url", "question"]
+
+
+def test_refresh_model_is_alias_not_versioned_id():
+    """REFRESH_MODEL must be a Claude Code alias, never a versioned model id.
+
+    Regression guard. The default was pinned to `opus-4-8`, which the CLI
+    rejects with api_error_status=404 — every OAuth refresh failed (41/41 in
+    /tmp/cloaked-proxy.log) while the proxy kept working on tokens Claude Code
+    refreshed on its own, so the breakage was invisible. Aliases track the
+    current model by design; versioned ids rot.
+    """
+    assert cp.REFRESH_MODEL in {"opus", "sonnet", "haiku"}, (
+        f"REFRESH_MODEL={cp.REFRESH_MODEL!r} is not a Claude Code alias. "
+        "Versioned ids (e.g. 'opus-4-8') are rejected by the CLI with a 404 "
+        "and silently break OAuth refresh."
+    )
+    # A versioned id is exactly what regressed; reject the shape, not one value.
+    assert not re.search(r"-\d", cp.REFRESH_MODEL), (
+        f"REFRESH_MODEL={cp.REFRESH_MODEL!r} looks version-pinned"
+    )
 
 
 if __name__ == "__main__":
