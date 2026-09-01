@@ -198,6 +198,41 @@ def test_refresh_model_is_alias_not_versioned_id():
     )
 
 
+def test_listed_models_all_have_context_limits():
+    """Every advertised model must have a MODEL_CONTEXT entry.
+
+    LISTED_MODELS drives the Hermes picker; MODEL_CONTEXT drives the context
+    limit reported for it. A model added to one and not the other is the exact
+    drift that left claude-opus-4-6 present in MODEL_CONTEXT but unselectable
+    for weeks.
+    """
+    missing = [m for m in cp.LISTED_MODELS if m not in cp.MODEL_CONTEXT]
+    assert not missing, f"advertised but no context limit: {missing}"
+
+
+def test_user_agent_version_meets_model_gate():
+    """The spoofed claude-cli version gates which models upstream will serve.
+
+    Anthropic rejects newer models on the User-Agent version string ALONE —
+    the locally installed CLI is irrelevant. `claude-fable-5-1` 400s with
+    "version 2.1.251 or newer is required" under the old 2.1.77 pin. Verified
+    against api.anthropic.com varying only the UA: 2.1.77 -> 400, 2.1.251 -> 200.
+
+    This guard fails if the pin is lowered below the floor needed by the models
+    we advertise, which would make LISTED_MODELS entries 400 at runtime.
+    """
+    ua = cp.CC_H["User-Agent"]
+    m = re.match(r"claude-cli/(\d+)\.(\d+)\.(\d+)", ua)
+    assert m, f"unparseable User-Agent: {ua!r}"
+    version = tuple(int(g) for g in m.groups())
+    # Floor demanded by the newest model in LISTED_MODELS (claude-fable-5-1).
+    assert version >= (2, 1, 251), (
+        f"User-Agent pins claude-cli {'.'.join(map(str, version))}, but "
+        "claude-fable-5-1 requires >= 2.1.251 upstream. Advertised models will "
+        "400 at runtime."
+    )
+
+
 if __name__ == "__main__":
     import traceback
     failures = 0

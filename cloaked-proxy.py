@@ -18,7 +18,14 @@ from pathlib import Path
 API = "https://api.anthropic.com"
 CC_SYS = "You are Claude Code, Anthropic's official CLI for Claude."
 CC_H = {
-    "User-Agent": "claude-cli/2.1.77 (external, cli)",
+    # Anthropic gates newer models on THIS version string alone — not on the
+    # locally installed CLI. `claude-fable-5-1` returns HTTP 400 "Claude Code
+    # 2.1.77 does not support this model; version 2.1.251 or newer is required"
+    # until this is bumped. Verified by probing api.anthropic.com directly with
+    # only the UA varied: 2.1.77 -> 400, 2.1.251 -> 200, 2.1.300 -> 200.
+    # Bump when a new model 400s with a version demand, then add it to
+    # MODEL_CONTEXT + LISTED_MODELS.
+    "User-Agent": "claude-cli/2.1.251 (external, cli)",
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,token-counting-2024-11-01",
     "x-app": "cli",
@@ -92,6 +99,7 @@ CC_DESC = {
 MODEL_CONTEXT = {
     "claude-opus-5": 1000000,
     "claude-opus-4-8": 1000000,
+    "claude-fable-5-1": 1000000,
     "claude-fable-5": 1000000,
     "claude-opus-4-7": 1000000,
     "claude-opus-4-6": 1000000,
@@ -109,6 +117,8 @@ MODEL_CONTEXT = {
 LISTED_MODELS = (
     "claude-opus-5",
     "claude-opus-4-8",
+    "claude-opus-4-6",
+    "claude-fable-5-1",
     "claude-fable-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-5-20250929",
