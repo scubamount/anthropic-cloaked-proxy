@@ -7,6 +7,7 @@ import re
 import socket
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -204,16 +205,34 @@ class Handler(BaseHTTPRequestHandler):
         body.pop("system", None)
         return body
 
+    def _models_page(self):
+        """Cursor-paginated /v1/models — mirrors cloaked-proxy._models_page.
+        Hermes probes with ?limit=1000 and paginates via after_id/last_id;
+        path-only matching 404s and Hermes falls back to the wrong catalog."""
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.rstrip("/") not in ("/v1/models", "/models"):
+            return None
+        qs = urllib.parse.parse_qs(parsed.query)
+        try:
+            limit = max(1, min(1000, int(qs.get("limit", ["20"])[0])))
+        except ValueError:
+            limit = 20
+        after_id = (qs.get("after_id") or [""])[0]
+        ids = list(LISTED_MODELS)
+        start = ids.index(after_id) + 1 if after_id in ids else 0
+        page = ids[start:start + limit]
+        return {"object": "list",
+                "data": [{"id": mid, "object": "model", "owned_by": "anthropic"}
+                         for mid in page],
+                "first_id": page[0] if page else None,
+                "last_id": page[-1] if page else None,
+                "has_more": start + limit < len(ids)}
+
     def do_GET(self):
-        """Stub /v1/models for provider model-list checks."""
-        if self.path.rstrip("/") in ("/v1/models", "/models"):
-            self._send_json(200, {
-                "object": "list",
-                "data": [
-                    {"id": mid, "object": "model", "owned_by": "anthropic"}
-                    for mid in LISTED_MODELS
-                ],
-            })
+        """Stub /v1/models (paginated) for provider model-list checks."""
+        page = self._models_page()
+        if page is not None:
+            self._send_json(200, page)
         else:
             self._send_json_error(404, f"not found: {self.path}")
 

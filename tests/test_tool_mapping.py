@@ -233,6 +233,42 @@ def test_user_agent_version_meets_model_gate():
     )
 
 
+def test_models_endpoint_answers_paginated_probe():
+    """GET /v1/models must honor ?limit= and ?after_id= (Anthropic cursor contract).
+
+    Hermes (hermes_cli/models.py::_anthropic_models_url) probes with
+    ?limit=1000 and follows after_id/last_id/has_more. The old handler matched
+    the path only, so the query string 404'd, the live catalog fetch returned
+    nothing, and Hermes silently served its curated api.anthropic.com list —
+    wrong ids, picker probe failures. This asserts the relationship the client
+    depends on, not a snapshot of the current model list.
+    """
+    import urllib.parse
+
+    handler = cp.Handler.__new__(cp.Handler)
+
+    handler.path = "/v1/models?limit=1000"
+    page = handler._models_page()
+    assert page is not None, "plain ?limit=1000 probe must not 404"
+    ids = [m["id"] for m in page["data"]]
+    assert ids == list(cp.LISTED_MODELS), "limit=1000 must return the full catalog"
+    assert page["has_more"] is False
+    assert page["last_id"] == ids[-1]
+
+    # Paginate with a page size smaller than the catalog: pages must tile
+    # exactly, terminate, and never loop (Hermes caps at 20 pages).
+    handler.path = "/v1/models?limit=3"
+    first = handler._models_page()
+    assert len(first["data"]) == 3 and first["has_more"] is True
+    handler.path = f"/v1/models?limit=3&after_id={first['last_id']}"
+    second = handler._models_page()
+    got = [m["id"] for m in first["data"]] + [m["id"] for m in second["data"]]
+    assert second["data"], "second page must not be empty while has_more was true"
+    assert len(set(got)) == len(got), f"pages must not overlap: {got}"
+    assert got == ids[: len(got)], f"pages must tile in order: {got}"
+    assert all(i in ids for i in got)
+
+
 if __name__ == "__main__":
     import traceback
     failures = 0

@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -687,16 +688,51 @@ class Handler(BaseHTTPRequestHandler):
             body.pop("tools", None)
         return body, tool_map, tool_schemas
 
+    def _models_page(self):
+        """Cursor-paginated /v1/models, Anthropic's real contract.
+
+        Hermes (hermes_cli/models.py::_anthropic_models_url) probes
+        /v1/models?limit=1000 and paginates with after_id=<last page's
+        last_id> while has_more is true. Path-only matching 404s on the
+        query string, the live fetch yields nothing, and Hermes silently
+        falls back to its curated api.anthropic.com catalog — the wrong
+        catalog for this endpoint (picker shows ids we cannot serve).
+        Answer the contract: honor limit, echo after_id semantics via a
+        stable ordinal cursor, final page reports has_more=false.
+        """
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.rstrip("/") not in ("/v1/models", "/models"):
+            return None
+        qs = urllib.parse.parse_qs(parsed.query)
+        try:
+            limit = max(1, min(1000, int(qs.get("limit", ["20"])[0])))
+        except ValueError:
+            limit = 20
+        after_id = (qs.get("after_id") or [""])[0]
+        ids = list(LISTED_MODELS)
+        start = 0
+        if after_id:
+            if after_id in ids:
+                start = ids.index(after_id) + 1
+            else:
+                # Unknown cursor: Anthropic 400s; a 200 with everything is
+                # harmless and keeps Hermes's loop bounded via last_id dedup.
+                start = 0
+        page = ids[start:start + limit]
+        has_more = start + limit < len(ids)
+        body = {"object": "list",
+                "data": [{"id": mid, "object": "model", "owned_by": "anthropic"}
+                         for mid in page],
+                "first_id": page[0] if page else None,
+                "last_id": page[-1] if page else None,
+                "has_more": has_more}
+        return body
+
     def do_GET(self):
-        """Stub /v1/models for provider model-list checks."""
-        if self.path.rstrip("/") in ("/v1/models", "/models"):
-            self._send_json(200, {
-                "object": "list",
-                "data": [
-                    {"id": mid, "object": "model", "owned_by": "anthropic"}
-                    for mid in LISTED_MODELS
-                ],
-            })
+        """Stub /v1/models (paginated) for provider model-list checks."""
+        page = self._models_page()
+        if page is not None:
+            self._send_json(200, page)
         else:
             self._send_json_error(404, f"not found: {self.path}")
 
