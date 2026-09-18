@@ -342,7 +342,10 @@ class TokenManager:
         now_ms = int(time.time() * 1000)
 
         # Collect candidate tokens from all sources with their expiry.
-        candidates: list[tuple[str, int]] = [] # (token, expires_at_ms)
+        # The source label TRAVELS with the candidate: sources append
+        # conditionally, so positional labels mislabel whenever a source is
+        # skipped (caught by red-arm — a setup win logged as "keychain").
+        candidates: list[tuple[str, int, str]] = [] # (token, expires_at_ms, source)
 
         # Source 1: credentials file (may not exist — Claude Code /login can
         # delete it and move to Keychain-only storage)
@@ -354,7 +357,7 @@ class TokenManager:
                 f_token = oauth.get("accessToken") or oauth.get("access_token") or ""
                 f_expires = int(oauth.get("expiresAt") or oauth.get("expires_at") or 0)
                 if f_token:
-                    candidates.append((f_token, f_expires))
+                    candidates.append((f_token, f_expires, "file"))
             except Exception as exc:
                 log(f"credential file read failed: {type(exc).__name__}: {exc}")
 
@@ -374,7 +377,7 @@ class TokenManager:
                 k_token = k_oauth.get("accessToken") or k_oauth.get("access_token") or ""
                 k_expires = int(k_oauth.get("expiresAt") or k_oauth.get("expires_at") or 0)
                 if k_token:
-                    candidates.append((k_token, k_expires))
+                    candidates.append((k_token, k_expires, "keychain"))
             except Exception:
                 pass # Keychain unavailable is non-fatal
 
@@ -397,8 +400,11 @@ class TokenManager:
                 s_token = result.stdout.strip()
             except Exception:
                 pass # absent is normal: backstop is opt-in by storing the item
+        # "" must never become a candidate: it ties expiry=0 with absent
+        # sources, shadows the real winner in max()/index(), and could be
+        # returned as the token itself. (Caught by red-arm of the backstop test.)
         if s_token:
-            candidates.append((s_token, 0))
+            candidates.append((s_token, 0, "setup"))
 
         if not candidates:
             raise RuntimeError(
@@ -409,24 +415,27 @@ class TokenManager:
         # Prefer the token with the latest future expiry.
         # This handles the case where one source has a stale expired token
         # while the other has a freshly refreshed one.
-        def _score(tok_exp: tuple[str, int]) -> float:
-            tok, exp = tok_exp
+        def _score(cand: tuple[str, int, str]) -> float:
+            tok, exp, _src = cand
             if not exp:
                 return 0.0
             remaining = (exp - now_ms) / 1000 # seconds left
             return remaining
 
-        best_token, best_expires = max(candidates, key=_score)
+        best = max(candidates, key=_score)
+        best_token, best_expires, src_label = best
         if not best_token:
             raise RuntimeError(
                 f"no valid OAuth token found in {CRED_FILE} or macOS Keychain"
             )
 
-        # Selection is by score; source labels come from the winning tuple
-        # itself — an equality check against one candidate shadowed the
-        # identical 99-byte-token trap and mislabelled setup-token wins.
-        labels = ["file", "keychain", "setup"]
-        src_label = labels[candidates.index((best_token, best_expires))]
+        if src_label == "setup":
+            # The backstop turning the refresh chain's death into a non-event
+            # is this arm's own failure mode — without this line the chain
+            # rots silently for the setup token's full year. Loud by design.
+            log("WARNING: SETUP BACKSTOP ACTIVE — running on the non-refreshable "
+                "setup token; the refreshable OAuth chain is DEAD and will not "
+                "recover itself. Re-auth with `claude auth login --sso`.")
         remaining_min = int((best_expires / 1000) - time.time()) // 60 if best_expires else 0
         if len(candidates) > 1:
             log(f"credential sources: file={int((f_expires/1000)-time.time())//60 if f_expires else 'N/A'}m, "

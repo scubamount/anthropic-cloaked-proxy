@@ -271,7 +271,7 @@ def test_models_endpoint_answers_paginated_probe():
     assert all(i in ids for i in got)
 
 
-def test_setup_token_is_backstop_never_priority(monkeypatch, tmp_path):
+def test_setup_token_is_backstop_never_priority(monkeypatch, tmp_path, capsys):
     """Setup token (expiry=0) must win ONLY when every refreshable candidate
     is expired — it cannot refresh, so a live access token must always beat it."""
     now_ms = int(time.time() * 1000)
@@ -296,6 +296,11 @@ def test_setup_token_is_backstop_never_priority(monkeypatch, tmp_path):
     tok, exp, _ = cp.TokenManager._read_credentials()
     assert tok == "setup-token-longlived", f"backstop did not take over: {tok}"
     assert exp == 0
+    # Backstop activation must be LOUD: a silent fallback masks the dead
+    # refresh chain for the setup token's whole year (divergent-review trap).
+    captured = capsys.readouterr()
+    assert "SETUP BACKSTOP ACTIVE" in captured.err, \
+        "backstop took over silently — refresh-chain death would rot unseen"
 
     # A live access token must beat the backstop.
     live_file = tmp_path / "creds-live.json"
@@ -305,6 +310,9 @@ def test_setup_token_is_backstop_never_priority(monkeypatch, tmp_path):
     monkeypatch.setattr(cp, "CRED_FILE", live_file)
     tok, _, _ = cp.TokenManager._read_credentials()
     assert tok == "file-token-live", f"setup token outranked live token: {tok}"
+    captured = capsys.readouterr()
+    assert "SETUP BACKSTOP ACTIVE" not in captured.err, \
+        "warning fired while a refreshable token was serving"
 
 
 if __name__ == "__main__":
