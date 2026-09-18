@@ -315,6 +315,49 @@ def test_setup_token_is_backstop_never_priority(monkeypatch, tmp_path, capsys):
         "warning fired while a refreshable token was serving"
 
 
+def test_thinking_pinned_disabled_and_thinking_blocks_never_forwarded():
+    """Server-default thinking on opus-5 must not leak into our sessions.
+
+    Two halves, both verified live against api.anthropic.com 2026-09-17:
+    1. The CC-fingerprint shape makes Anthropic DEFAULT thinking ON — a
+       request without `thinking` returns an encrypted thinking block before
+       any text. _prepare_body must pin {type: disabled} even when the
+       client asked for enabled.
+    2. Replaying an assistant thinking block while thinking is disabled is
+       an upstream 400 ("Invalid `signature` in `thinking` block") that
+       kills the whole turn. fix_message must strip thinking/redacted_thinking
+       blocks from tool_use passthrough lists.
+    """
+    handler = cp.Handler.__new__(cp.Handler)
+
+    out, _, _ = handler._prepare_body({
+        "model": "claude-opus-5", "max_tokens": 100,
+        "thinking": {"type": "enabled", "budget_tokens": 2000},
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert out.get("thinking") == {"type": "disabled"}, out.get("thinking")
+
+    msg = {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "", "signature": "CAISx"},
+        {"type": "tool_use", "id": "tu_1", "name": "Read", "input": {}},
+    ]}
+    fixed = cp.fix_message(msg)
+    kinds = [b.get("type") for b in fixed["content"]]
+    assert "thinking" not in kinds, kinds
+    assert "tool_use" in kinds, kinds  # the actual payload survives
+
+    # assistant turn that was ONLY a thinking block -> drop, don't 400 upstream
+    only_think = {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "", "signature": "CAISx"}]}
+    # has_tools is False for a thinking-only list, so it goes through the
+    # text path: flatten yields "" for thinking, and empty assistant turns
+    # are dropped. Either None or no thinking block is acceptable.
+    if only_think is not None:
+        f2 = cp.fix_message(only_think)
+        assert f2 is None or not any(
+            b.get("type") == "thinking" for b in f2["content"]
+            if isinstance(b, dict))
+
+
 if __name__ == "__main__":
     import traceback
     failures = 0

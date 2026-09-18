@@ -604,7 +604,17 @@ def fix_message(msg):
         b.get("type") in ("tool_use", "tool_result") for b in content
         if isinstance(b, dict))
     if has_tools:
-        return {"role": role, "content": content}
+        # thinking/redacted_thinking blocks must never be forwarded: with
+        # thinking pinned disabled upstream rejects a replayed block
+        # (verified: HTTP 400 "Invalid `signature` in `thinking` block"),
+        # which kills the whole turn and reads as a tool error. Signature
+        # validity is irrelevant — the block simply cannot be sent.
+        passthrough = [b for b in content
+                       if not (isinstance(b, dict)
+                               and b.get("type") in ("thinking", "redacted_thinking"))]
+        if not passthrough:
+            return None
+        return {"role": role, "content": passthrough}
     return {"role": role, "content": text}
 
 
@@ -675,6 +685,16 @@ class Handler(BaseHTTPRequestHandler):
                   "output_config", "metadata", "stop_sequences", "tool_choice")
         for f in banned:
             body.pop(f, None)
+        # opus-5 adaptive thinking: with the CC fingerprint Anthropic now
+        # DEFAULTS thinking ON — a request with no `thinking` param gets an
+        # (encrypted, signature-only) thinking block prepended to every
+        # reply. The old `banned`-strip dropped the client's param and
+        # silently inherited that server default. Pin thinking OFF
+        # explicitly: verified live that {type: disabled} returns text-only
+        # while omitting the block returns thinking+text. Behavior, not
+        # decoration — encrypted thinking blocks surface as opaque blobs in
+        # chat UIs and change model output shape.
+        body["thinking"] = {"type": "disabled"}
         body["max_tokens"] = min(body.get("max_tokens", 64000), 64000)
 
         msgs = []
