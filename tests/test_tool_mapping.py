@@ -1,7 +1,9 @@
 """Unit tests for cloaked-proxy tool name mapping (no-collision fix)."""
 import importlib.util
+import json
 import re
 import sys
+import time
 from pathlib import Path
 
 # Load cloaked-proxy.py as a module (file is hyphenated so direct import is awkward)
@@ -267,6 +269,42 @@ def test_models_endpoint_answers_paginated_probe():
     assert len(set(got)) == len(got), f"pages must not overlap: {got}"
     assert got == ids[: len(got)], f"pages must tile in order: {got}"
     assert all(i in ids for i in got)
+
+
+def test_setup_token_is_backstop_never_priority(monkeypatch, tmp_path):
+    """Setup token (expiry=0) must win ONLY when every refreshable candidate
+    is expired — it cannot refresh, so a live access token must always beat it."""
+    now_ms = int(time.time() * 1000)
+    dead_file = tmp_path / "creds-dead.json"
+    dead_file.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "file-token-expired",
+        "expiresAt": now_ms - 10 * 60 * 1000}}))
+
+    def fake_run(cmd, **kw):
+        class R:
+            returncode, stdout = 0, ""
+            if "-s" in cmd and cmd[cmd.index("-s") + 1] == cp.SETUP_TOKEN_SERVICE:
+                stdout = "setup-token-longlived"
+            else:
+                returncode = 44  # access-token Keychain item absent
+        return R()
+
+    monkeypatch.setattr(cp, "CRED_FILE", dead_file)
+    monkeypatch.setattr(cp.subprocess, "run", fake_run)
+    monkeypatch.setenv(cp.SETUP_TOKEN_ENV, "")  # force the keychain read path
+
+    tok, exp, _ = cp.TokenManager._read_credentials()
+    assert tok == "setup-token-longlived", f"backstop did not take over: {tok}"
+    assert exp == 0
+
+    # A live access token must beat the backstop.
+    live_file = tmp_path / "creds-live.json"
+    live_file.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "file-token-live",
+        "expiresAt": now_ms + 8 * 60 * 60 * 1000}}))
+    monkeypatch.setattr(cp, "CRED_FILE", live_file)
+    tok, _, _ = cp.TokenManager._read_credentials()
+    assert tok == "file-token-live", f"setup token outranked live token: {tok}"
 
 
 if __name__ == "__main__":

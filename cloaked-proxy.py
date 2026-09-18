@@ -45,6 +45,11 @@ EXPIRY_REFRESH_MARGIN_SEC = int(os.environ.get("CLOAKED_PROXY_EXPIRY_MARGIN_SEC"
 # Aliases always resolve to a current model, which is the whole point of them.
 # Override with CLOAKED_REFRESH_MODEL.
 REFRESH_MODEL = os.environ.get("CLOAKED_REFRESH_MODEL", "opus")
+# Long-lived `claude setup-token` (sk-ant-oat01, ~1yr) stored in the macOS
+# Keychain as a non-refreshable backstop. Opt-in: absent item = classic
+# file/Keychain OAuth only, exactly as before.
+SETUP_TOKEN_SERVICE = "claude-setup-token"
+SETUP_TOKEN_ENV = "CLOAKED_SETUP_TOKEN"
 
 # Semantic grouping: 28 Hermes tools → 14 CC names
 _MAPPING = [
@@ -373,10 +378,32 @@ class TokenManager:
             except Exception:
                 pass # Keychain unavailable is non-fatal
 
+        # Source 3: long-lived setup token (sk-ant-oat01, ~1yr, read-only —
+        # cannot refresh, so it never wins while a refreshable access token
+        # is valid: expiry=0 scores 0.0 and only beats EXPIRED candidates).
+        # This is the backstop that ends the OAuth death-spiral: when the
+        # interactive session dies and `claude` cannot refresh, the proxy
+        # keeps serving instead of hard-failing until a human re-logins.
+        s_token = os.environ.get(SETUP_TOKEN_ENV, "")
+        if not s_token and sys.platform == "darwin":
+            try:
+                result = subprocess.run(
+                    ["security", "find-generic-password", "-s", SETUP_TOKEN_SERVICE, "-w"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                s_token = result.stdout.strip()
+            except Exception:
+                pass # absent is normal: backstop is opt-in by storing the item
+        if s_token:
+            candidates.append((s_token, 0))
+
         if not candidates:
             raise RuntimeError(
-                f"no OAuth token found in {CRED_FILE} or macOS Keychain — "
-                f"run `claude /login` to refresh credentials"
+                f"no OAuth token found in {CRED_FILE}, macOS Keychain, or "
+                f"{SETUP_TOKEN_SERVICE!r} — run `claude /login` to refresh credentials"
             )
 
         # Prefer the token with the latest future expiry.
@@ -395,11 +422,16 @@ class TokenManager:
                 f"no valid OAuth token found in {CRED_FILE} or macOS Keychain"
             )
 
-        src_label = "file" if best_token == f_token else "keychain"
+        # Selection is by score; source labels come from the winning tuple
+        # itself — an equality check against one candidate shadowed the
+        # identical 99-byte-token trap and mislabelled setup-token wins.
+        labels = ["file", "keychain", "setup"]
+        src_label = labels[candidates.index((best_token, best_expires))]
         remaining_min = int((best_expires / 1000) - time.time()) // 60 if best_expires else 0
         if len(candidates) > 1:
             log(f"credential sources: file={int((f_expires/1000)-time.time())//60 if f_expires else 'N/A'}m, "
-                f"keychain={int((k_expires/1000)-time.time())//60 if k_expires else 'N/A'}m → "
+                f"keychain={int((k_expires/1000)-time.time())//60 if k_expires else 'N/A'}m, "
+                f"setup={'yes' if s_token else 'no'} → "
                 f"using {src_label} ({remaining_min}m)")
 
         cred_mtime = CRED_FILE.stat().st_mtime if CRED_FILE.exists() else 0.0
