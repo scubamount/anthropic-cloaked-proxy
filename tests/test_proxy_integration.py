@@ -450,3 +450,99 @@ def test_live_mcp_browser_roundtrip():
     except urllib.error.HTTPError as exc:
         detail = exc.read(300).decode(errors="replace")
         pytest.fail(f"HTTP {exc.code}: {detail}")
+
+
+# -----------------------------------------------------------------------------
+# Adaptive-thinking self-healing (fable-5 / fable-5-1 rejection class).
+# -----------------------------------------------------------------------------
+def test_do_post_retries_with_adaptive_on_thinking_rejection(monkeypatch):
+    """Upstream 400 naming the disabled pin -> learn the model, retry with
+    adaptive, never surface the 400 to the client. Exercises the real
+    ``do_POST`` wiring (not just the predicate)."""
+    import io
+
+    handler = cloaked.Handler.__new__(cloaked.Handler)
+    raw = json.dumps({
+        "model": "claude-future-9", "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    handler.rfile = io.BytesIO(raw)
+    handler.headers = {"Content-Length": str(len(raw))}
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "model": "claude-future-9", "content": [{"type": "text", "text": "ok"}],
+                "usage": {},
+            }).encode()
+
+    captured = []
+    calls = {"n": 0}
+
+    def fake_open(b):
+        calls["n"] += 1
+        captured.append(dict(b))
+        if calls["n"] == 1:
+            raise cloaked.UpstreamHTTPError(
+                400,
+                b'{"type":"error","error":{"message":'
+                b'"\\"thinking.type.disabled\\" is not supported for this model. '
+                b'Use \\"thinking.type.adaptive\\" ..."}}',
+            )
+        return FakeResp()
+
+    sent = {}
+    monkeypatch.setattr(handler, "_open_upstream_with_auth_retry", fake_open, raising=False)
+    monkeypatch.setattr(
+        handler, "_send_json",
+        lambda code, payload, content_type="application/json": sent.update(code=code, payload=payload),
+        raising=False,
+    )
+
+    try:
+        handler.do_POST()
+        assert calls["n"] == 2, f"expected one retry, got {calls['n']} upstream calls"
+        assert captured[0].get("thinking") == {"type": "disabled"}, captured[0].get("thinking")
+        assert captured[1].get("thinking") == {"type": "adaptive"}, captured[1].get("thinking")
+        assert "claude-future-9" in cloaked._adaptive_learned
+        assert sent.get("code") == 200, sent
+    finally:
+        cloaked._adaptive_learned.discard("claude-future-9")
+
+
+def test_do_post_does_not_retry_unrelated_400(monkeypatch):
+    """Only the disabled-rejection signature retries; other 400s surface."""
+    import io
+
+    handler = cloaked.Handler.__new__(cloaked.Handler)
+    raw = json.dumps({
+        "model": "claude-opus-5", "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    handler.rfile = io.BytesIO(raw)
+    handler.headers = {"Content-Length": str(len(raw))}
+
+    calls = {"n": 0}
+
+    def fake_open(b):
+        calls["n"] += 1
+        raise cloaked.UpstreamHTTPError(400, b'{"error":{"message":"unrelated"}}')
+
+    sent = {}
+    monkeypatch.setattr(handler, "_open_upstream_with_auth_retry", fake_open, raising=False)
+    monkeypatch.setattr(
+        handler, "_send_json",
+        lambda code, payload, content_type="application/json": sent.update(code=code, payload=payload),
+        raising=False,
+    )
+
+    handler.do_POST()
+    assert calls["n"] == 1, f"unrelated 400 must not retry, got {calls['n']}"
+    assert sent.get("code") == 400, sent
+    assert "claude-opus-5" not in cloaked._adaptive_learned

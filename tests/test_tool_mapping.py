@@ -318,15 +318,19 @@ def test_setup_token_is_backstop_never_priority(monkeypatch, tmp_path, capsys):
 def test_thinking_pinned_disabled_and_thinking_blocks_never_forwarded():
     """Server-default thinking on opus-5 must not leak into our sessions.
 
-    Two halves, both verified live against api.anthropic.com 2026-09-17:
+    Three halves, all verified live against api.anthropic.com:
     1. The CC-fingerprint shape makes Anthropic DEFAULT thinking ON — a
        request without `thinking` returns an encrypted thinking block before
        any text. _prepare_body must pin {type: disabled} even when the
-       client asked for enabled.
+       client asked for enabled. (opus-5, 2026-09-17)
     2. Replaying an assistant thinking block while thinking is disabled is
        an upstream 400 ("Invalid `signature` in `thinking` block") that
        kills the whole turn. fix_message must strip thinking/redacted_thinking
        blocks from tool_use passthrough lists.
+    3. The adaptive-only line (fable-5 / fable-5-1) 400s on disabled with
+       `"thinking.type.disabled" is not supported for this model` — measured
+       2026-09-21 — so the pin must be adaptive for those ids, and a runtime
+       learned rejection must flip any new model after one 400.
     """
     handler = cp.Handler.__new__(cp.Handler)
 
@@ -335,6 +339,37 @@ def test_thinking_pinned_disabled_and_thinking_blocks_never_forwarded():
         "thinking": {"type": "enabled", "budget_tokens": 2000},
         "messages": [{"role": "user", "content": "hi"}]})
     assert out.get("thinking") == {"type": "disabled"}, out.get("thinking")
+
+    for model in ("claude-fable-5", "claude-fable-5-1"):
+        adaptive, _, _ = handler._prepare_body({
+            "model": model, "max_tokens": 100,
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert adaptive.get("thinking") == {"type": "adaptive"}, (
+            model, adaptive.get("thinking"))
+
+    # Runtime-learned: a model promoted by the 400-retry path pins adaptive
+    # for the rest of the process, and only the rejected model flips.
+    cp._adaptive_learned.add("claude-fable-6")
+    try:
+        learned, _, _ = handler._prepare_body({
+            "model": "claude-fable-6", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert learned.get("thinking") == {"type": "adaptive"}, learned.get("thinking")
+        other, _, _ = handler._prepare_body({
+            "model": "claude-opus-5", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert other.get("thinking") == {"type": "disabled"}, other.get("thinking")
+    finally:
+        cp._adaptive_learned.discard("claude-fable-6")
+
+    # The retry predicate must fire ONLY on the disabled-rejection signature.
+    assert cp._is_thinking_disabled_rejection(
+        cp.UpstreamHTTPError(400, b'{"error":{"message":"\\"thinking.type.disabled\\" is not supported for this model"}}'))
+    assert not cp._is_thinking_disabled_rejection(
+        cp.UpstreamHTTPError(400, b'{"error":{"message":"some other 400"}}'))
+    assert not cp._is_thinking_disabled_rejection(
+        cp.UpstreamHTTPError(429, b"thinking.type.disabled"))
 
     msg = {"role": "assistant", "content": [
         {"type": "thinking", "thinking": "", "signature": "CAISx"},

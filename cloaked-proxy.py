@@ -618,6 +618,32 @@ def fix_message(msg):
     return {"role": role, "content": text}
 
 
+# Models that REJECT {"type": "disabled"} — Anthropic's adaptive-only line.
+# Measured live 2026-09-21: claude-fable-5 and claude-fable-5-1 return HTTP 400
+# `"thinking.type.disabled" is not supported for this model. Use
+# "thinking.type.adaptive" and "output_config.effort" to control thinking
+# behavior.` while every other picker model (opus-5, opus-4-8, opus-4-6,
+# sonnet-4-6, sonnet-4-5, haiku-4-5) still accepts disabled. Adaptive is
+# accepted by BOTH families, so it is also the safe fallback below.
+THINKING_ADAPTIVE_MODELS = {"claude-fable-5", "claude-fable-5-1"}
+# Runtime-learned rejections: a 400 carrying the signature above promotes the
+# model here for the life of the process. Anthropic is shipping adaptive-only
+# models; without this a brand-new id 400s every turn until someone edits the
+# static set above.
+_adaptive_learned: set[str] = set()
+
+
+def _thinking_for_model(model: str) -> dict:
+    if model in THINKING_ADAPTIVE_MODELS or model in _adaptive_learned:
+        return {"type": "adaptive"}
+    return {"type": "disabled"}
+
+
+def _is_thinking_disabled_rejection(exc: "UpstreamHTTPError") -> bool:
+    """True when upstream 400s specifically on the disabled-thinking pin."""
+    return exc.code == 400 and b"thinking.type.disabled" in (exc.body or b"")
+
+
 class UpstreamHTTPError(Exception):
     def __init__(self, code: int, body: bytes, headers=None):
         super().__init__(f"upstream HTTP {code}")
@@ -694,7 +720,12 @@ class Handler(BaseHTTPRequestHandler):
         # while omitting the block returns thinking+text. Behavior, not
         # decoration — encrypted thinking blocks surface as opaque blobs in
         # chat UIs and change model output shape.
-        body["thinking"] = {"type": "disabled"}
+        #
+        # Exception: the adaptive-only line (fable-5 / fable-5-1, measured
+        # 2026-09-21) 400s on `disabled` and accepts `adaptive`; pinning
+        # disabled there broke every turn on those models. See
+        # _thinking_for_model.
+        body["thinking"] = _thinking_for_model(body.get("model", ""))
         body["max_tokens"] = min(body.get("max_tokens", 64000), 64000)
 
         msgs = []
@@ -812,7 +843,23 @@ class Handler(BaseHTTPRequestHandler):
         body["stream"] = False
 
         try:
-            with self._open_upstream_with_auth_retry(body) as resp:
+            try:
+                resp = self._open_upstream_with_auth_retry(body)
+            except UpstreamHTTPError as e:
+                # Self-healing for new adaptive-only models: upstream 400s on
+                # the disabled pin -> learn the model, retry once with
+                # adaptive. A 400 means nothing was generated, so the retry
+                # is safe and idempotent.
+                if _is_thinking_disabled_rejection(e):
+                    model = body.get("model", "")
+                    _adaptive_learned.add(model)
+                    log(f"upstream rejects thinking=disabled for {model!r}; "
+                        "retrying with thinking=adaptive")
+                    body["thinking"] = {"type": "adaptive"}
+                    resp = self._open_upstream_with_auth_retry(body)
+                else:
+                    raise
+            with resp:
                 self._send_message_response(resp, tool_map, tool_schemas, as_sse=want_stream)
         except UpstreamHTTPError as e:
             self._send_json(e.code, e.body, e.headers.get("Content-Type", "application/json"))
