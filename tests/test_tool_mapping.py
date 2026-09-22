@@ -212,13 +212,47 @@ def test_listed_models_all_have_context_limits():
     assert not missing, f"advertised but no context limit: {missing}"
 
 
+def test_opus_5_5_gets_adaptive_thinking():
+    """claude-opus-5-5 is adaptive-only: pinning disabled 400s every turn.
+
+    Measured live 2026-09-22 against api.anthropic.com:
+      thinking {"type":"disabled"}            -> 400 '"thinking.type.disabled"
+                                                  is not supported for this model'
+      thinking {"type":"adaptive"}            -> 200, text-only
+      thinking {"type":"adaptive","effort":…} -> 400 'thinking.adaptive.effort:
+                                                  Extra inputs are not permitted'
+
+    Same class as the fable-5 line. The `effort` arm matters because the docs
+    advertise a default effort for this model, which invites adding the key
+    inside the thinking object where upstream rejects it.
+    """
+    body, _, _ = cp.Handler.__new__(cp.Handler)._prepare_body({
+        "model": "claude-opus-5-5", "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert body["thinking"] == {"type": "adaptive"}, (
+        f"opus-5-5 must get bare adaptive thinking, got {body['thinking']!r}"
+    )
+    # Non-adaptive models must keep the disabled pin (no blanket switch).
+    body2, _, _ = cp.Handler.__new__(cp.Handler)._prepare_body({
+        "model": "claude-opus-5", "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert body2["thinking"] == {"type": "disabled"}, (
+        f"opus-5 must stay disabled, got {body2['thinking']!r}"
+    )
+
+
 def test_user_agent_version_meets_model_gate():
     """The spoofed claude-cli version gates which models upstream will serve.
 
     Anthropic rejects newer models on the User-Agent version string ALONE —
     the locally installed CLI is irrelevant. `claude-fable-5-1` 400s with
-    "version 2.1.251 or newer is required" under the old 2.1.77 pin. Verified
-    against api.anthropic.com varying only the UA: 2.1.77 -> 400, 2.1.251 -> 200.
+    "version 2.1.251 or newer is required" under the old 2.1.77 pin;
+    `claude-opus-5-5` then raised the floor again, 400ing under 2.1.251 with
+    "version 2.1.280 or newer is required". Verified against api.anthropic.com
+    varying only the UA: 2.1.77 -> 400, 2.1.251 -> 200 (fable) / 400 (opus-5-5),
+    2.1.280 -> 200, 2.1.300 -> 200.
 
     This guard fails if the pin is lowered below the floor needed by the models
     we advertise, which would make LISTED_MODELS entries 400 at runtime.
@@ -227,10 +261,10 @@ def test_user_agent_version_meets_model_gate():
     m = re.match(r"claude-cli/(\d+)\.(\d+)\.(\d+)", ua)
     assert m, f"unparseable User-Agent: {ua!r}"
     version = tuple(int(g) for g in m.groups())
-    # Floor demanded by the newest model in LISTED_MODELS (claude-fable-5-1).
-    assert version >= (2, 1, 251), (
+    # Floor demanded by the newest model in LISTED_MODELS (claude-opus-5-5).
+    assert version >= (2, 1, 280), (
         f"User-Agent pins claude-cli {'.'.join(map(str, version))}, but "
-        "claude-fable-5-1 requires >= 2.1.251 upstream. Advertised models will "
+        "claude-opus-5-5 requires >= 2.1.280 upstream. Advertised models will "
         "400 at runtime."
     )
 

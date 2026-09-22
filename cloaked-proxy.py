@@ -20,13 +20,19 @@ API = "https://api.anthropic.com"
 CC_SYS = "You are Claude Code, Anthropic's official CLI for Claude."
 CC_H = {
     # Anthropic gates newer models on THIS version string alone — not on the
-    # locally installed CLI. `claude-fable-5-1` returns HTTP 400 "Claude Code
+    # locally installed CLI. `claude-fable-5-1` returned HTTP 400 "Claude Code
     # 2.1.77 does not support this model; version 2.1.251 or newer is required"
-    # until this is bumped. Verified by probing api.anthropic.com directly with
-    # only the UA varied: 2.1.77 -> 400, 2.1.251 -> 200, 2.1.300 -> 200.
-    # Bump when a new model 400s with a version demand, then add it to
-    # MODEL_CONTEXT + LISTED_MODELS.
-    "User-Agent": "claude-cli/2.1.251 (external, cli)",
+    # until this was bumped; `claude-opus-5-5` then demanded >= 2.1.280 on
+    # 2026-09-22 (same 400, new floor). Verified by probing api.anthropic.com
+    # directly with only the UA varied: 2.1.77 -> 400, 2.1.251 -> 200 (fable),
+    # 2.1.251 -> 400 (opus-5-5), 2.1.280 -> 200, 2.1.300 -> 200.
+    #
+    # Pinned ABOVE the highest observed floor on purpose: this gate has now
+    # fired twice, and a pin sitting exactly at the floor re-breaks on the next
+    # model. Bump when a new model 400s with a version demand, then add it to
+    # MODEL_CONTEXT + LISTED_MODELS (and THINKING_ADAPTIVE_MODELS if it also
+    # rejects thinking.type.disabled).
+    "User-Agent": "claude-cli/2.1.300 (external, cli)",
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,token-counting-2024-11-01",
     "x-app": "cli",
@@ -103,6 +109,7 @@ CC_DESC = {
 
 # Model context limits (from platform.claude.com/docs/en/about-claude/models/overview)
 MODEL_CONTEXT = {
+    "claude-opus-5-5": 1000000,
     "claude-opus-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-fable-5-1": 1000000,
@@ -121,6 +128,7 @@ MODEL_CONTEXT = {
 # Curated subset of MODEL_CONTEXT — the ids we actually want selectable, in
 # display order. Both proxies' do_GET iterate this, so it's the single source.
 LISTED_MODELS = (
+    "claude-opus-5-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-6",
@@ -619,13 +627,20 @@ def fix_message(msg):
 
 
 # Models that REJECT {"type": "disabled"} — Anthropic's adaptive-only line.
-# Measured live 2026-09-21: claude-fable-5 and claude-fable-5-1 return HTTP 400
-# `"thinking.type.disabled" is not supported for this model. Use
-# "thinking.type.adaptive" and "output_config.effort" to control thinking
-# behavior.` while every other picker model (opus-5, opus-4-8, opus-4-6,
-# sonnet-4-6, sonnet-4-5, haiku-4-5) still accepts disabled. Adaptive is
-# accepted by BOTH families, so it is also the safe fallback below.
-THINKING_ADAPTIVE_MODELS = {"claude-fable-5", "claude-fable-5-1"}
+# Measured live 2026-09-21: claude-fable-5 / claude-fable-5-1, and again
+# 2026-09-22 for claude-opus-5-5, return HTTP 400 `"thinking.type.disabled" is
+# not supported for this model. Use "thinking.type.adaptive" and
+# "output_config.effort" to control thinking behavior.` while the remaining
+# picker models (opus-5, opus-4-8, opus-4-6, sonnet-4-6, sonnet-4-5, haiku-4-5)
+# still accept disabled. Adaptive is accepted by BOTH families, so it is also
+# the safe fallback below.
+#
+# Send `{"type": "adaptive"}` BARE: adding the docs-advertised `effort` key
+# inside the thinking object 400s with `thinking.adaptive.effort: Extra inputs
+# are not permitted` (measured on opus-5-5). Effort rides in `output_config`,
+# which this proxy strips as part of the cloak.
+THINKING_ADAPTIVE_MODELS = {"claude-fable-5", "claude-fable-5-1",
+                            "claude-opus-5-5"}
 # Runtime-learned rejections: a 400 carrying the signature above promotes the
 # model here for the life of the process. Anthropic is shipping adaptive-only
 # models; without this a brand-new id 400s every turn until someone edits the
