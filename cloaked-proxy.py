@@ -109,6 +109,7 @@ CC_DESC = {
 
 # Model context limits (from platform.claude.com/docs/en/about-claude/models/overview)
 MODEL_CONTEXT = {
+    "claude-sonnet-5-5": 1000000,
     "claude-opus-5-5": 1000000,
     "claude-opus-5": 1000000,
     "claude-opus-4-8": 1000000,
@@ -129,6 +130,7 @@ MODEL_CONTEXT = {
 # display order. Both proxies' do_GET iterate this, so it's the single source.
 LISTED_MODELS = (
     "claude-opus-5-5",
+    "claude-sonnet-5-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-6",
@@ -627,20 +629,20 @@ def fix_message(msg):
 
 
 # Models that REJECT {"type": "disabled"} — Anthropic's adaptive-only line.
-# Measured live 2026-09-21: claude-fable-5 / claude-fable-5-1, and again
-# 2026-09-22 for claude-opus-5-5, return HTTP 400 `"thinking.type.disabled" is
-# not supported for this model. Use "thinking.type.adaptive" and
-# "output_config.effort" to control thinking behavior.` while the remaining
-# picker models (opus-5, opus-4-8, opus-4-6, sonnet-4-6, sonnet-4-5, haiku-4-5)
-# still accept disabled. Adaptive is accepted by BOTH families, so it is also
-# the safe fallback below.
+# 2026-09-21: claude-fable-5 / claude-fable-5-1, and again
+# 2026-09-22 for claude-opus-5-5 and claude-sonnet-5-5, return HTTP 400
+# `"thinking.type.disabled" is not supported for this model. Use
+# "thinking.type.adaptive" and "output_config.effort" to control thinking
+# behavior.` while the remaining picker models (opus-5, opus-4-8, opus-4-6,
+# sonnet-4-6, sonnet-4-5, haiku-4-5) still accept disabled. Adaptive is
+# accepted by BOTH families, so it is also the safe fallback below.
 #
 # Send `{"type": "adaptive"}` BARE: adding the docs-advertised `effort` key
 # inside the thinking object 400s with `thinking.adaptive.effort: Extra inputs
 # are not permitted` (measured on opus-5-5). Effort rides in `output_config`,
 # which this proxy strips as part of the cloak.
 THINKING_ADAPTIVE_MODELS = {"claude-fable-5", "claude-fable-5-1",
-                            "claude-opus-5-5"}
+                            "claude-opus-5-5", "claude-sonnet-5-5"}
 # Runtime-learned rejections: a 400 carrying the signature above promotes the
 # model here for the life of the process. Anthropic is shipping adaptive-only
 # models; without this a brand-new id 400s every turn until someone edits the

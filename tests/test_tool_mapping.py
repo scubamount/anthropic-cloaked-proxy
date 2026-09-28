@@ -6,6 +6,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 # Load cloaked-proxy.py as a module (file is hyphenated so direct import is awkward)
 spec = importlib.util.spec_from_file_location(
     "cloaked_proxy",
@@ -212,34 +214,67 @@ def test_listed_models_all_have_context_limits():
     assert not missing, f"advertised but no context limit: {missing}"
 
 
-def test_opus_5_5_gets_adaptive_thinking():
-    """claude-opus-5-5 is adaptive-only: pinning disabled 400s every turn.
+# Pinned literally, NOT read from cp.THINKING_ADAPTIVE_MODELS. Parametrizing
+# over the source set would make it define its own coverage: dropping a model
+# from the set would shrink the test list (3 passed instead of failing) and
+# blanking it would collect zero tests — both green while the route is broken.
+EXPECTED_ADAPTIVE = ("claude-fable-5", "claude-fable-5-1",
+                     "claude-opus-5-5", "claude-sonnet-5-5")
 
-    Measured live 2026-09-22 against api.anthropic.com:
-      thinking {"type":"disabled"}            -> 400 '"thinking.type.disabled"
+
+def test_adaptive_set_matches_measured_upstream():
+    """The adaptive set is an upstream fact, not a preference — pin it.
+
+    Measured live 2026-09-21/22: each id here 400s on thinking=disabled. An id
+    added without probing, or dropped while still adaptive, breaks every turn
+    in one direction and only shows up as a user-visible 400 in the other.
+    """
+    assert set(cp.THINKING_ADAPTIVE_MODELS) == set(EXPECTED_ADAPTIVE), (
+        f"adaptive set drifted: have {sorted(cp.THINKING_ADAPTIVE_MODELS)}, "
+        f"expected {sorted(EXPECTED_ADAPTIVE)}. Probe api.anthropic.com before "
+        "changing either side."
+    )
+
+
+@pytest.mark.parametrize("model", EXPECTED_ADAPTIVE)
+def test_adaptive_models_get_adaptive_thinking(model):
+    """Adaptive-only models 400 on the thinking=disabled pin; get bare adaptive.
+
+    Measured live 2026-09-22 against api.anthropic.com on claude-opus-5-5 and
+    claude-sonnet-5-5 (and 2026-09-21 on the fable line):
+      thinking {"type":"disabled"}            -> 400 '"thinking.type.disabled
                                                   is not supported for this model'
       thinking {"type":"adaptive"}            -> 200, text-only
       thinking {"type":"adaptive","effort":…} -> 400 'thinking.adaptive.effort:
                                                   Extra inputs are not permitted'
 
-    Same class as the fable-5 line. The `effort` arm matters because the docs
-    advertise a default effort for this model, which invites adding the key
-    inside the thinking object where upstream rejects it.
+    The `effort` arm matters because the docs advertise a default effort for
+    these models, which invites adding the key inside the thinking object where
+    upstream rejects it.
     """
     body, _, _ = cp.Handler.__new__(cp.Handler)._prepare_body({
-        "model": "claude-opus-5-5", "max_tokens": 100,
+        "model": model, "max_tokens": 100,
         "messages": [{"role": "user", "content": "hi"}],
     })
     assert body["thinking"] == {"type": "adaptive"}, (
-        f"opus-5-5 must get bare adaptive thinking, got {body['thinking']!r}"
+        f"{model} must get bare adaptive thinking, got {body['thinking']!r}"
     )
-    # Non-adaptive models must keep the disabled pin (no blanket switch).
-    body2, _, _ = cp.Handler.__new__(cp.Handler)._prepare_body({
-        "model": "claude-opus-5", "max_tokens": 100,
+
+
+@pytest.mark.parametrize("model", [m for m in cp.LISTED_MODELS
+                                   if m not in EXPECTED_ADAPTIVE])
+def test_non_adaptive_models_keep_thinking_disabled(model):
+    """No blanket switch to adaptive: the disabled pin must survive elsewhere.
+
+    The adaptive/disabled split is per-model because a 400 on either shape kills
+    a whole turn, so both directions need coverage.
+    """
+    body, _, _ = cp.Handler.__new__(cp.Handler)._prepare_body({
+        "model": model, "max_tokens": 100,
         "messages": [{"role": "user", "content": "hi"}],
     })
-    assert body2["thinking"] == {"type": "disabled"}, (
-        f"opus-5 must stay disabled, got {body2['thinking']!r}"
+    assert body["thinking"] == {"type": "disabled"}, (
+        f"{model} must keep thinking disabled, got {body['thinking']!r}"
     )
 
 
