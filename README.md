@@ -76,6 +76,17 @@ cd ~/proxies && env -u PYTHONPATH python3 -m pytest tests/ -q      # 28 passed, 
 cd ~/proxies && env -u PYTHONPATH python3 -m pytest tests/ -q --live   # + live roundtrip
 ```
 
+Fast standalone model-catalog check — offline, no pytest or network needed, so
+it also works over SSH or from a pre-commit hook. Exits non-zero on any
+violation (proxy list parity, missing context limits, wrong per-model thinking
+shape, replayed thinking blocks):
+
+```bash
+./scripts/verify_models.py
+```
+
+`pytest tests/` remains the canonical gate; this is the quick one.
+
 ## Files
 
 | File | Purpose |
