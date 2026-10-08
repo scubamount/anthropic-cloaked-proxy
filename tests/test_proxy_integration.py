@@ -546,3 +546,87 @@ def test_do_post_does_not_retry_unrelated_400(monkeypatch):
     assert calls["n"] == 1, f"unrelated 400 must not retry, got {calls['n']}"
     assert sent.get("code") == 400, sent
     assert "claude-opus-5" not in cloaked._adaptive_learned
+
+
+# -----------------------------------------------------------------------------
+# Keepalive: a slow non-streamed upstream must not starve a streaming client.
+# -----------------------------------------------------------------------------
+class _BufWriter:
+    def __init__(self):
+        self.buf = bytearray()
+
+    def write(self, b):
+        self.buf += b
+
+    def flush(self):
+        pass
+
+
+def _streaming_handler(monkeypatch, fake_open):
+    import io
+
+    handler = cloaked.Handler.__new__(cloaked.Handler)
+    raw = json.dumps({
+        "model": "claude-opus-5", "max_tokens": 8, "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    handler.rfile = io.BytesIO(raw)
+    handler.headers = {"Content-Length": str(len(raw))}
+    handler.wfile = _BufWriter()
+    statuses = []
+    monkeypatch.setattr(handler, "send_response", lambda code, *a: statuses.append(code), raising=False)
+    monkeypatch.setattr(handler, "send_header", lambda *a: None, raising=False)
+    monkeypatch.setattr(handler, "end_headers", lambda: None, raising=False)
+    monkeypatch.setattr(handler, "_open_upstream_with_auth_retry", fake_open, raising=False)
+    monkeypatch.setattr(cloaked, "KEEPALIVE_COMMIT_AFTER", 0.05)
+    monkeypatch.setattr(cloaked, "KEEPALIVE_INTERVAL", 0.05)
+    return handler, statuses
+
+
+def test_slow_upstream_streams_pings_then_message(monkeypatch):
+    import time as _t
+
+    class SlowResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            _t.sleep(0.3)
+            return json.dumps({"model": "claude-opus-5", "stop_reason": "end_turn",
+                               "content": [{"type": "text", "text": "ok"}], "usage": {}}).encode()
+
+    handler, statuses = _streaming_handler(monkeypatch, lambda b: SlowResp())
+    handler.do_POST()
+    out = bytes(handler.wfile.buf).decode()
+    assert statuses == [200], statuses  # exactly one status line
+    assert out.index("event: ping") < out.index("event: message_start")
+    assert "event: message_stop" in out
+
+
+def test_slow_upstream_timeout_after_commit_is_sse_error(monkeypatch):
+    import socket as _s
+    import time as _t
+
+    def fake_open(b):
+        _t.sleep(0.2)
+        raise _s.timeout("The read operation timed out")
+
+    handler, statuses = _streaming_handler(monkeypatch, fake_open)
+    handler.do_POST()
+    out = bytes(handler.wfile.buf).decode()
+    assert statuses == [200], statuses
+    assert "event: error" in out and "timed out" in out
+
+
+def test_fast_upstream_error_keeps_real_status(monkeypatch):
+    def fake_open(b):
+        raise cloaked.UpstreamHTTPError(429, b'{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}')
+
+    handler, statuses = _streaming_handler(monkeypatch, fake_open)
+    monkeypatch.setattr(cloaked, "KEEPALIVE_COMMIT_AFTER", 5)
+    handler.do_POST()
+    assert statuses == [429], statuses
+    assert b"event: ping" not in bytes(handler.wfile.buf)

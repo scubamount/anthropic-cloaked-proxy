@@ -37,7 +37,20 @@ CC_H = {
     "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,token-counting-2024-11-01",
     "x-app": "cli",
 }
-UPSTREAM_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_UPSTREAM_TIMEOUT", "180"))
+# Upstream is forced non-streaming (see do_POST), so the socket is silent for
+# the WHOLE generation: Opus emits ~80-95 tok/s, so a 64k max_tokens reply needs
+# ~800s. At the old 180s every reply past ~15k output tokens died with
+# "The read operation timed out" -> 502 -> Hermes retried the identical request
+# up to 30x: 111 such 502s in agent.log (2026-09/10), each one a subagent that
+# looked like it was spinning forever. Must stay below Hermes' 900s stale-stream
+# threshold so the proxy reports the timeout, not a silent client-side kill.
+UPSTREAM_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_UPSTREAM_TIMEOUT", "840"))
+# Streaming clients get SSE headers once the upstream call has been silent this
+# long, then a `ping` event every KEEPALIVE_INTERVAL, so no hop's per-read
+# timeout (soul proxy, httpx) fires while upstream is still generating.
+# Fast failures (400/401/429) land before the commit and keep their real status.
+KEEPALIVE_COMMIT_AFTER = float(os.environ.get("CLOAKED_PROXY_KEEPALIVE_COMMIT_AFTER", "20"))
+KEEPALIVE_INTERVAL = float(os.environ.get("CLOAKED_PROXY_KEEPALIVE_INTERVAL", "15"))
 REFRESH_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_REFRESH_TIMEOUT", "120"))
 EXPIRY_REFRESH_MARGIN_SEC = int(os.environ.get("CLOAKED_PROXY_EXPIRY_MARGIN_SEC", "600"))
 # Model the OAuth-refresh probe asks Claude Code to use.
@@ -669,11 +682,62 @@ class UpstreamHTTPError(Exception):
         self.headers = headers or {}
 
 
+class _SSEKeepalive:
+    """Hold a streaming client's connection open while upstream generates.
+
+    Waits KEEPALIVE_COMMIT_AFTER seconds, then commits the 200 SSE headers and
+    writes an Anthropic ``ping`` event every KEEPALIVE_INTERVAL. ``stop()``
+    returns True if headers were committed: the caller must then finish the
+    reply as SSE (message or ``error`` event), never a fresh status line.
+    """
+
+    def __init__(self, handler: "BaseHTTPRequestHandler"):
+        self._h = handler
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self.committed = False
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self):
+        if self._done.wait(KEEPALIVE_COMMIT_AFTER):
+            return
+        with self._lock:
+            if self._done.is_set():
+                return
+            try:
+                self._h.send_response(200)
+                self._h.send_header("Content-Type", "text/event-stream")
+                self._h.send_header("Cache-Control", "no-cache")
+                self._h.send_header("X-Accel-Buffering", "no")
+                self._h.end_headers()
+                self.committed = True
+            except (BrokenPipeError, OSError):
+                return
+        while True:
+            with self._lock:
+                if self._done.is_set():
+                    return
+                try:
+                    self._h.wfile.write(b'event: ping\ndata: {"type": "ping"}\n\n')
+                    self._h.wfile.flush()
+                except (BrokenPipeError, OSError):
+                    return
+            if self._done.wait(KEEPALIVE_INTERVAL):
+                return
+
+    def stop(self) -> bool:
+        with self._lock:
+            self._done.set()
+        self._t.join(timeout=1)
+        return self.committed
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send_json(self, code: int, payload: dict | bytes, content_type: str = "application/json"):
+    def _send_status_json(self, code: int, payload: dict | bytes, content_type: str = "application/json"):
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(code if code < 600 else 502)
         self.send_header("Content-Type", content_type or "application/json")
@@ -689,6 +753,26 @@ class Handler(BaseHTTPRequestHandler):
         if detail:
             error["detail"] = detail[:1000]
         self._send_json(code, {"type": "error", "error": error})
+
+    def _send_json(self, code: int, payload: dict | bytes, content_type: str = "application/json"):
+        """Status-line reply, or an SSE ``error`` event once keepalive committed 200."""
+        if getattr(self, "_sse_committed", False):
+            if code < 400:
+                return
+            try:
+                data = payload if isinstance(payload, dict) else json.loads(payload or b"{}")
+            except (ValueError, TypeError):
+                data = {}
+            if not isinstance(data.get("error"), dict):
+                data = {"type": "error", "error": {"type": "api_error", "message": f"upstream HTTP {code}"}}
+            data.setdefault("type", "error")
+            try:
+                self.wfile.write(f"event: error\ndata: {json.dumps(data)}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            return
+        self._send_status_json(code, payload, content_type)
 
     def _make_upstream_request(self, body: dict, token: str) -> urllib.request.Request:
         return urllib.request.Request(
@@ -859,6 +943,8 @@ class Handler(BaseHTTPRequestHandler):
         # JSON body; re-synthesize SSE downstream if the client asked to stream.
         body["stream"] = False
 
+        self._sse_committed = False
+        keepalive = _SSEKeepalive(self) if want_stream else None
         try:
             try:
                 resp = self._open_upstream_with_auth_retry(body)
@@ -877,18 +963,28 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise
             with resp:
-                self._send_message_response(resp, tool_map, tool_schemas, as_sse=want_stream)
+                self._send_message_response(resp, tool_map, tool_schemas, as_sse=want_stream,
+                                            keepalive=keepalive)
         except UpstreamHTTPError as e:
+            self._finish_keepalive(keepalive)
             self._send_json(e.code, e.body, e.headers.get("Content-Type", "application/json"))
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            self._finish_keepalive(keepalive)
             self._send_json_error(502, "Anthropic upstream unreachable or timed out", "upstream_error", str(exc))
         except RuntimeError as exc:
+            self._finish_keepalive(keepalive)
             self._send_json_error(503, "Claude OAuth unavailable", "auth_error", str(exc))
         except Exception as exc:
+            self._finish_keepalive(keepalive)
             log(f"unexpected request failure: {type(exc).__name__}: {exc}")
             self._send_json_error(500, "cloaked proxy internal error", "proxy_error", f"{type(exc).__name__}: {exc}")
 
-    def _send_message_response(self, resp, tool_map: dict, tool_schemas: dict | None = None, as_sse: bool = False):
+    def _finish_keepalive(self, keepalive) -> None:
+        if keepalive is not None and keepalive.stop():
+            self._sse_committed = True
+
+    def _send_message_response(self, resp, tool_map: dict, tool_schemas: dict | None = None, as_sse: bool = False,
+                               keepalive=None):
         tool_schemas = tool_schemas or {}
         # The upstream model does not always echo the cloaked tool name we
         # sent (e.g. it returns bare ``read`` when we declared ``Skill__read``).
@@ -902,6 +998,7 @@ class Handler(BaseHTTPRequestHandler):
             if _sc is not None:
                 schemas_by_hs.setdefault(_hs, _sc)
         data = resp.read()
+        self._finish_keepalive(keepalive)
         if not data:
             self._send_json_error(502, "empty upstream response", "upstream_error")
             return
@@ -952,11 +1049,12 @@ class Handler(BaseHTTPRequestHandler):
             return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
 
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
+            if not getattr(self, "_sse_committed", False):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
 
             content = result.get("content", [])
             start_msg = {k: v for k, v in result.items() if k != "content"}
