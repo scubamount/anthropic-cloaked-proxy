@@ -37,20 +37,11 @@ CC_H = {
     "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14,token-counting-2024-11-01",
     "x-app": "cli",
 }
-# Upstream is forced non-streaming (see do_POST), so the socket is silent for
-# the WHOLE generation: Opus emits ~80-95 tok/s, so a 64k max_tokens reply needs
-# ~800s. At the old 180s every reply past ~15k output tokens died with
-# "The read operation timed out" -> 502 -> Hermes retried the identical request
-# up to 30x: 111 such 502s in agent.log (2026-09/10), each one a subagent that
-# looked like it was spinning forever. Must stay below Hermes' 900s stale-stream
-# threshold so the proxy reports the timeout, not a silent client-side kill.
-UPSTREAM_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_UPSTREAM_TIMEOUT", "840"))
-# Streaming clients get SSE headers once the upstream call has been silent this
-# long, then a `ping` event every KEEPALIVE_INTERVAL, so no hop's per-read
-# timeout (soul proxy, httpx) fires while upstream is still generating.
-# Fast failures (400/401/429) land before the commit and keep their real status.
-KEEPALIVE_COMMIT_AFTER = float(os.environ.get("CLOAKED_PROXY_KEEPALIVE_COMMIT_AFTER", "20"))
-KEEPALIVE_INTERVAL = float(os.environ.get("CLOAKED_PROXY_KEEPALIVE_INTERVAL", "15"))
+# Per-socket-read timeout. Streaming clients get upstream SSE passed through
+# live (Anthropic emits deltas and pings continuously), so this only bounds
+# silence between events. Non-streaming clients still wait for the whole body:
+# Opus runs ~80-95 tok/s, so a 64k max_tokens reply can need ~800s+.
+UPSTREAM_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_UPSTREAM_TIMEOUT", "900"))
 REFRESH_TIMEOUT = int(os.environ.get("CLOAKED_PROXY_REFRESH_TIMEOUT", "120"))
 EXPIRY_REFRESH_MARGIN_SEC = int(os.environ.get("CLOAKED_PROXY_EXPIRY_MARGIN_SEC", "600"))
 # Model the OAuth-refresh probe asks Claude Code to use.
@@ -682,57 +673,6 @@ class UpstreamHTTPError(Exception):
         self.headers = headers or {}
 
 
-class _SSEKeepalive:
-    """Hold a streaming client's connection open while upstream generates.
-
-    Waits KEEPALIVE_COMMIT_AFTER seconds, then commits the 200 SSE headers and
-    writes an Anthropic ``ping`` event every KEEPALIVE_INTERVAL. ``stop()``
-    returns True if headers were committed: the caller must then finish the
-    reply as SSE (message or ``error`` event), never a fresh status line.
-    """
-
-    def __init__(self, handler: "BaseHTTPRequestHandler"):
-        self._h = handler
-        self._lock = threading.Lock()
-        self._done = threading.Event()
-        self.committed = False
-        self._t = threading.Thread(target=self._run, daemon=True)
-        self._t.start()
-
-    def _run(self):
-        if self._done.wait(KEEPALIVE_COMMIT_AFTER):
-            return
-        with self._lock:
-            if self._done.is_set():
-                return
-            try:
-                self._h.send_response(200)
-                self._h.send_header("Content-Type", "text/event-stream")
-                self._h.send_header("Cache-Control", "no-cache")
-                self._h.send_header("X-Accel-Buffering", "no")
-                self._h.end_headers()
-                self.committed = True
-            except (BrokenPipeError, OSError):
-                return
-        while True:
-            with self._lock:
-                if self._done.is_set():
-                    return
-                try:
-                    self._h.wfile.write(b'event: ping\ndata: {"type": "ping"}\n\n')
-                    self._h.wfile.flush()
-                except (BrokenPipeError, OSError):
-                    return
-            if self._done.wait(KEEPALIVE_INTERVAL):
-                return
-
-    def stop(self) -> bool:
-        with self._lock:
-            self._done.set()
-        self._t.join(timeout=1)
-        return self.committed
-
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -755,7 +695,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(code, {"type": "error", "error": error})
 
     def _send_json(self, code: int, payload: dict | bytes, content_type: str = "application/json"):
-        """Status-line reply, or an SSE ``error`` event once keepalive committed 200."""
+        """Status-line reply, or an SSE ``error`` event once a stream committed 200."""
         if getattr(self, "_sse_committed", False):
             if code < 400:
                 return
@@ -939,12 +879,15 @@ class Handler(BaseHTTPRequestHandler):
 
         want_stream = bool(body.get("stream", False))
         body, tool_map, tool_schemas = self._prepare_body(body)
-        # Force non-streaming upstream so tool-arg coercion runs on a complete
-        # JSON body; re-synthesize SSE downstream if the client asked to stream.
-        body["stream"] = False
+        # Stream upstream when the client streams: text/thinking deltas pass
+        # through live, so the client sees first bytes in seconds. Forcing
+        # non-streaming left the socket silent for the whole generation; long
+        # replies hit read timeouts, 502'd, and Hermes retried the identical
+        # request (subagents "spinning forever"). Tool_use blocks are still
+        # buffered per block so names are uncloaked and args coerced whole.
+        body["stream"] = want_stream
 
         self._sse_committed = False
-        keepalive = _SSEKeepalive(self) if want_stream else None
         try:
             try:
                 resp = self._open_upstream_with_auth_retry(body)
@@ -963,28 +906,123 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise
             with resp:
-                self._send_message_response(resp, tool_map, tool_schemas, as_sse=want_stream,
-                                            keepalive=keepalive)
+                if want_stream:
+                    self._relay_stream(resp, tool_map, tool_schemas)
+                else:
+                    self._send_message_response(resp, tool_map, tool_schemas)
         except UpstreamHTTPError as e:
-            self._finish_keepalive(keepalive)
             self._send_json(e.code, e.body, e.headers.get("Content-Type", "application/json"))
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            self._finish_keepalive(keepalive)
             self._send_json_error(502, "Anthropic upstream unreachable or timed out", "upstream_error", str(exc))
         except RuntimeError as exc:
-            self._finish_keepalive(keepalive)
             self._send_json_error(503, "Claude OAuth unavailable", "auth_error", str(exc))
         except Exception as exc:
-            self._finish_keepalive(keepalive)
             log(f"unexpected request failure: {type(exc).__name__}: {exc}")
             self._send_json_error(500, "cloaked proxy internal error", "proxy_error", f"{type(exc).__name__}: {exc}")
 
-    def _finish_keepalive(self, keepalive) -> None:
-        if keepalive is not None and keepalive.stop():
-            self._sse_committed = True
+    @staticmethod
+    def _schema_index(tool_map: dict, tool_schemas: dict) -> dict:
+        """hermes-side-name -> schema. The model does not always echo the
+        cloaked name we sent (returns bare ``read`` for ``Skill__read``);
+        without this fallback coercion is silently skipped and stringified
+        numerics (offset="505") reach strict clients (OpenCode)."""
+        by_hs = {}
+        for ck, hs in tool_map.items():
+            sc = tool_schemas.get(ck)
+            if sc is not None:
+                by_hs.setdefault(hs, sc)
+        return by_hs
 
-    def _send_message_response(self, resp, tool_map: dict, tool_schemas: dict | None = None, as_sse: bool = False,
-                               keepalive=None):
+    def _fix_tool_block(self, block: dict, tool_map: dict, tool_schemas: dict, by_hs: dict, mode: str) -> None:
+        """Uncloak a tool_use block's name and coerce its args in place."""
+        cloaked = block.get("name", "")
+        # Unknown cloaked name (model invented one): structural fallback.
+        block["name"] = tool_map[cloaked] if cloaked in tool_map else _uncloak_tool_name(cloaked)
+        schema = tool_schemas.get(cloaked)
+        if schema is None:
+            schema = by_hs.get(block.get("name"))
+        before = json.dumps(block.get("input")) if os.environ.get("CLOAK_TRACE") else None
+        coerce_tool_args(block.get("input"), schema)
+        if os.environ.get("CLOAK_TRACE"):
+            log("TRACE tool=%s cloaked=%s schema_found=%s props=%s before=%s after=%s mode=%s"
+                % (block.get("name"), cloaked, schema is not None,
+                   json.dumps((schema or {}).get("properties", {})), before,
+                   json.dumps(block.get("input")), mode))
+
+    def _relay_stream(self, resp, tool_map: dict, tool_schemas: dict) -> None:
+        """Pass upstream SSE through event by event.
+
+        Every event is forwarded as it arrives except tool_use blocks, which
+        are held from content_block_start to content_block_stop, then
+        re-emitted as start (uncloaked name) + one input_json_delta (coerced
+        args) + stop. An upstream failure after the 200 is committed becomes
+        an SSE ``error`` event (see _send_json)."""
+        by_hs = self._schema_index(tool_map, tool_schemas)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self._sse_committed = True
+
+        held: dict[int, dict] = {}  # index -> {"block": ..., "json": [...]}
+
+        def emit(event: str, payload) -> None:
+            data = payload if isinstance(payload, str) else json.dumps(payload)
+            self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode())
+            self.wfile.flush()
+
+        event, data_lines = None, []
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line.startswith("event:"):
+                event = line[6:].strip()
+                continue
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+                continue
+            if line or event is None:
+                continue
+            data = "\n".join(data_lines)
+            ev, event, data_lines = event, None, []
+            try:
+                obj = json.loads(data) if data else {}
+            except json.JSONDecodeError:
+                emit(ev, data)
+                continue
+            idx = obj.get("index")
+            if ev == "content_block_start" and obj.get("content_block", {}).get("type") == "tool_use":
+                held[idx] = {"block": dict(obj["content_block"]), "json": []}
+                continue
+            if idx in held:
+                if ev == "content_block_delta":
+                    held[idx]["json"].append(obj.get("delta", {}).get("partial_json", ""))
+                    continue
+                if ev == "content_block_stop":
+                    h = held.pop(idx)
+                    block = h["block"]
+                    joined = "".join(h["json"])
+                    try:
+                        block["input"] = json.loads(joined) if joined else {}
+                    except json.JSONDecodeError:
+                        block["input"] = {}
+                    self._fix_tool_block(block, tool_map, tool_schemas, by_hs, "stream")
+                    args = block.pop("input")
+                    emit("content_block_start", {"type": "content_block_start", "index": idx,
+                                                 "content_block": {**block, "input": {}}})
+                    emit("content_block_delta", {"type": "content_block_delta", "index": idx,
+                                                 "delta": {"type": "input_json_delta",
+                                                           "partial_json": json.dumps(args)}})
+                    emit("content_block_stop", obj)
+                    continue
+            if ev == "message_start":
+                msg = obj.get("message", {})
+                ctx = MODEL_CONTEXT.get(msg.get("model", ""), 200000)
+                msg["_model_context"] = ctx
+                msg["_hermes_note"] = f"Model: {msg.get('model', '')} ({ctx//1000}k context)"
+            emit(ev, obj)
+
+    def _send_message_response(self, resp, tool_map: dict, tool_schemas: dict | None = None):
         tool_schemas = tool_schemas or {}
         # The upstream model does not always echo the cloaked tool name we
         # sent (e.g. it returns bare ``read`` when we declared ``Skill__read``).
@@ -992,13 +1030,8 @@ class Handler(BaseHTTPRequestHandler):
         # regardless of whether the model replied with the cloaked or the
         # uncloaked name. Without this, coercion is silently skipped and
         # stringified numerics (offset="505") reach strict clients (OpenCode).
-        schemas_by_hs = {}
-        for _ck, _hs in tool_map.items():
-            _sc = tool_schemas.get(_ck)
-            if _sc is not None:
-                schemas_by_hs.setdefault(_hs, _sc)
+        by_hs = self._schema_index(tool_map, tool_schemas)
         data = resp.read()
-        self._finish_keepalive(keepalive)
         if not data:
             self._send_json_error(502, "empty upstream response", "upstream_error")
             return
@@ -1010,74 +1043,14 @@ class Handler(BaseHTTPRequestHandler):
 
         for block in result.get("content", []):
             if block.get("type") == "tool_use":
-                cloaked = block.get("name", "")
-                if cloaked in tool_map:
-                    block["name"] = tool_map[cloaked]
-                else:
-                    # Structural fallback for any cloaked name we didn't
-                    # explicitly emit (e.g. model invented one).
-                    block["name"] = _uncloak_tool_name(cloaked)
-                _before = json.dumps(block.get("input")) if os.environ.get("CLOAK_TRACE") else None
-                # Resolve schema by cloaked key first; if the model replied with
-                # the bare hermes-side name (cloaked not in tool_schemas), fall
-                # back to the hs-name index so coercion still runs.
-                _schema = tool_schemas.get(cloaked)
-                if _schema is None:
-                    _schema = schemas_by_hs.get(block.get("name"))
-                coerce_tool_args(block.get("input"), _schema)
-                if os.environ.get("CLOAK_TRACE"):
-                    _props = (_schema or {}).get("properties", {})
-                    log("TRACE tool=%s cloaked=%s schema_found=%s props=%s before=%s after=%s as_sse=%s"
-                        % (block.get("name"), cloaked, _schema is not None,
-                           json.dumps(_props), _before, json.dumps(block.get("input")), as_sse))
+                self._fix_tool_block(block, tool_map, tool_schemas, by_hs, "json")
 
         model = result.get("model", "")
         ctx = MODEL_CONTEXT.get(model, 200000)
         result["_model_context"] = ctx
         result["_hermes_note"] = f"Model: {model} ({ctx//1000}k context)"
 
-        if as_sse:
-            self._emit_message_as_sse(result)
-        else:
-            self._send_json(200, result)
-
-    def _emit_message_as_sse(self, result: dict):
-        # Synthesize an Anthropic-style SSE stream from a complete message so a
-        # streaming client gets the coerced (non-stream) body. Whole content
-        # blocks are sent at once rather than token-by-token.
-        def sse(event: str, payload: dict) -> bytes:
-            return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
-
-        try:
-            if not getattr(self, "_sse_committed", False):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("X-Accel-Buffering", "no")
-                self.end_headers()
-
-            content = result.get("content", [])
-            start_msg = {k: v for k, v in result.items() if k != "content"}
-            start_msg["content"] = []
-            self.wfile.write(sse("message_start", {"type": "message_start", "message": start_msg}))
-
-            for idx, block in enumerate(content):
-                btype = block.get("type")
-                if btype == "text":
-                    self.wfile.write(sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}}))
-                    self.wfile.write(sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": block.get("text", "")}}))
-                elif btype == "tool_use":
-                    self.wfile.write(sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": {"type": "tool_use", "id": block.get("id", ""), "name": block.get("name", ""), "input": {}}}))
-                    self.wfile.write(sse("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": json.dumps(block.get("input", {}))}}))
-                else:
-                    self.wfile.write(sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": block}))
-                self.wfile.write(sse("content_block_stop", {"type": "content_block_stop", "index": idx}))
-
-            self.wfile.write(sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": result.get("stop_reason"), "stop_sequence": result.get("stop_sequence")}, "usage": result.get("usage", {})}))
-            self.wfile.write(sse("message_stop", {"type": "message_stop"}))
-            self.wfile.flush()
-        except (BrokenPipeError, OSError):
-            pass
+        self._send_json(200, result)
 
 
 if __name__ == "__main__":

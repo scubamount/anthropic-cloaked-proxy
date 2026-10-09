@@ -549,84 +549,151 @@ def test_do_post_does_not_retry_unrelated_400(monkeypatch):
 
 
 # -----------------------------------------------------------------------------
-# Keepalive: a slow non-streamed upstream must not starve a streaming client.
+# Streaming relay: upstream SSE passes through live; tool_use is fixed per block.
 # -----------------------------------------------------------------------------
 class _BufWriter:
     def __init__(self):
         self.buf = bytearray()
+        self.writes = 0
 
     def write(self, b):
         self.buf += b
+        self.writes += 1
 
     def flush(self):
         pass
 
 
-def _streaming_handler(monkeypatch, fake_open):
+def _sse(event, payload):
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
+
+
+def _streaming_handler(monkeypatch, fake_open, tools=None):
     import io
 
     handler = cloaked.Handler.__new__(cloaked.Handler)
-    raw = json.dumps({
-        "model": "claude-opus-5", "max_tokens": 8, "stream": True,
-        "messages": [{"role": "user", "content": "hi"}],
-    }).encode()
+    req = {"model": "claude-opus-5", "max_tokens": 8, "stream": True,
+           "messages": [{"role": "user", "content": "hi"}]}
+    if tools:
+        req["tools"] = tools
+    raw = json.dumps(req).encode()
     handler.rfile = io.BytesIO(raw)
     handler.headers = {"Content-Length": str(len(raw))}
     handler.wfile = _BufWriter()
-    statuses = []
+    statuses, sent_bodies = [], []
     monkeypatch.setattr(handler, "send_response", lambda code, *a: statuses.append(code), raising=False)
     monkeypatch.setattr(handler, "send_header", lambda *a: None, raising=False)
     monkeypatch.setattr(handler, "end_headers", lambda: None, raising=False)
-    monkeypatch.setattr(handler, "_open_upstream_with_auth_retry", fake_open, raising=False)
-    monkeypatch.setattr(cloaked, "KEEPALIVE_COMMIT_AFTER", 0.05)
-    monkeypatch.setattr(cloaked, "KEEPALIVE_INTERVAL", 0.05)
-    return handler, statuses
+
+    def opener(body):
+        sent_bodies.append(dict(body))
+        return fake_open(body)
+
+    monkeypatch.setattr(handler, "_open_upstream_with_auth_retry", opener, raising=False)
+    return handler, statuses, sent_bodies
 
 
-def test_slow_upstream_streams_pings_then_message(monkeypatch):
-    import time as _t
+class _StreamResp:
+    def __init__(self, chunks, fail_after=None):
+        self._lines = b"".join(chunks).splitlines(keepends=True)
+        self._fail_after = fail_after
 
-    class SlowResp:
-        def __enter__(self):
-            return self
+    def __enter__(self):
+        return self
 
-        def __exit__(self, *exc):
-            return False
+    def __exit__(self, *exc):
+        return False
 
-        def read(self):
-            _t.sleep(0.3)
-            return json.dumps({"model": "claude-opus-5", "stop_reason": "end_turn",
-                               "content": [{"type": "text", "text": "ok"}], "usage": {}}).encode()
+    def __iter__(self):
+        for i, line in enumerate(self._lines):
+            if self._fail_after is not None and i == self._fail_after:
+                import socket as _s
+                raise _s.timeout("The read operation timed out")
+            yield line
 
-    handler, statuses = _streaming_handler(monkeypatch, lambda b: SlowResp())
+
+def _events(buf):
+    out = []
+    for frame in bytes(buf).decode().split("\n\n"):
+        if not frame.strip():
+            continue
+        ev = data = None
+        for line in frame.splitlines():
+            if line.startswith("event:"):
+                ev = line[6:].strip()
+            elif line.startswith("data:"):
+                data = json.loads(line[5:])
+        out.append((ev, data))
+    return out
+
+
+def test_stream_requests_stream_upstream_and_relays_text_live(monkeypatch):
+    chunks = [
+        _sse("message_start", {"type": "message_start", "message": {"model": "claude-opus-5", "content": []}}),
+        _sse("ping", {"type": "ping"}),
+        _sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "text", "text": ""}}),
+        _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "text_delta", "text": "he"}}),
+        _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "text_delta", "text": "llo"}}),
+        _sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        _sse("message_stop", {"type": "message_stop"}),
+    ]
+    handler, statuses, sent = _streaming_handler(monkeypatch, lambda b: _StreamResp(chunks))
     handler.do_POST()
-    out = bytes(handler.wfile.buf).decode()
-    assert statuses == [200], statuses  # exactly one status line
-    assert out.index("event: ping") < out.index("event: message_start")
-    assert "event: message_stop" in out
+    assert sent[0]["stream"] is True, "streaming client must stream upstream"
+    assert statuses == [200]
+    evs = _events(handler.wfile.buf)
+    names = [e for e, _ in evs]
+    assert names == ["message_start", "ping", "content_block_start", "content_block_delta",
+                     "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+    assert evs[0][1]["message"]["_model_context"] == cloaked.MODEL_CONTEXT["claude-opus-5"]
+    assert [d["delta"]["text"] for e, d in evs if e == "content_block_delta"] == ["he", "llo"]
 
 
-def test_slow_upstream_timeout_after_commit_is_sse_error(monkeypatch):
-    import socket as _s
-    import time as _t
-
-    def fake_open(b):
-        _t.sleep(0.2)
-        raise _s.timeout("The read operation timed out")
-
-    handler, statuses = _streaming_handler(monkeypatch, fake_open)
+def test_stream_tool_use_uncloaked_and_coerced(monkeypatch):
+    tools = [{"name": "read", "input_schema": {"type": "object", "properties": {
+        "offset": {"description": "line offset"}}}}]
+    cloaked_name = cloaked._cloaked_tool_name("read")
+    chunks = [
+        _sse("message_start", {"type": "message_start", "message": {"model": "claude-opus-5", "content": []}}),
+        _sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "tool_use", "id": "tu1", "name": cloaked_name, "input": {}}}),
+        _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "input_json_delta", "partial_json": '{"offs'}}),
+        _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "input_json_delta", "partial_json": 'et": "505"}'}}),
+        _sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        _sse("message_stop", {"type": "message_stop"}),
+    ]
+    handler, statuses, _ = _streaming_handler(monkeypatch, lambda b: _StreamResp(chunks), tools=tools)
     handler.do_POST()
-    out = bytes(handler.wfile.buf).decode()
+    evs = _events(handler.wfile.buf)
+    start = next(d for e, d in evs if e == "content_block_start")
+    assert start["content_block"]["name"] == "read"
+    deltas = [d for e, d in evs if e == "content_block_delta"]
+    assert len(deltas) == 1
+    assert json.loads(deltas[0]["delta"]["partial_json"]) == {"offset": 505}
+
+
+def test_stream_timeout_after_commit_is_sse_error(monkeypatch):
+    chunks = [
+        _sse("message_start", {"type": "message_start", "message": {"model": "claude-opus-5", "content": []}}),
+        _sse("ping", {"type": "ping"}),
+    ]
+    handler, statuses, _ = _streaming_handler(monkeypatch, lambda b: _StreamResp(chunks, fail_after=3))
+    handler.do_POST()
+    evs = _events(handler.wfile.buf)
     assert statuses == [200], statuses
-    assert "event: error" in out and "timed out" in out
+    assert evs[-1][0] == "error" and "timed out" in json.dumps(evs[-1][1])
 
 
-def test_fast_upstream_error_keeps_real_status(monkeypatch):
+def test_stream_fast_upstream_error_keeps_real_status(monkeypatch):
     def fake_open(b):
         raise cloaked.UpstreamHTTPError(429, b'{"type":"error","error":{"type":"rate_limit_error","message":"slow"}}')
 
-    handler, statuses = _streaming_handler(monkeypatch, fake_open)
-    monkeypatch.setattr(cloaked, "KEEPALIVE_COMMIT_AFTER", 5)
+    handler, statuses, _ = _streaming_handler(monkeypatch, fake_open)
     handler.do_POST()
     assert statuses == [429], statuses
-    assert b"event: ping" not in bytes(handler.wfile.buf)

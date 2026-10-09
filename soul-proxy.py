@@ -15,9 +15,9 @@ from pathlib import Path
 DOWNSTREAM = "http://127.0.0.1:8318/v1/messages"
 SOUL_FILE = Path.home() / ".hermes" / "SOUL.md"
 # Per-read timeout on the cloaked hop. Above cloaked-proxy's UPSTREAM_TIMEOUT
-# (840s) so a non-streaming request reports the upstream's own error instead of
-# this hop timing out first; streaming requests also get keepalive pings.
-DOWNSTREAM_TIMEOUT = 870
+# (900s) so a non-streaming request reports the upstream's own error instead of
+# this hop timing out first. Streaming requests see events every few seconds.
+DOWNSTREAM_TIMEOUT = 930
 
 # Models advertised via GET /v1/models. MUST mirror cloaked-proxy.LISTED_MODELS;
 # duplicated as a literal because soul-proxy can't import the hyphenated
@@ -283,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             while True:
-                # read1: forward whatever arrived (keepalive pings are ~40 B);
+                # read1: forward whatever arrived (single deltas/pings are ~100 B);
                 # read(16384) blocked until 16 KB or EOF and starved the client.
                 chunk = resp.read1(16384)
                 if not chunk:
