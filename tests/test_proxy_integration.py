@@ -568,7 +568,7 @@ def _sse(event, payload):
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
 
 
-def _streaming_handler(monkeypatch, fake_open, tools=None):
+def _streaming_handler(monkeypatch, fake_open, tools=None, headers=None):
     import io
 
     handler = cloaked.Handler.__new__(cloaked.Handler)
@@ -578,7 +578,7 @@ def _streaming_handler(monkeypatch, fake_open, tools=None):
         req["tools"] = tools
     raw = json.dumps(req).encode()
     handler.rfile = io.BytesIO(raw)
-    handler.headers = {"Content-Length": str(len(raw))}
+    handler.headers = {"Content-Length": str(len(raw)), **(headers or {})}
     handler.wfile = _BufWriter()
     statuses, sent_bodies = [], []
     monkeypatch.setattr(handler, "send_response", lambda code, *a: statuses.append(code), raising=False)
@@ -697,3 +697,29 @@ def test_stream_fast_upstream_error_keeps_real_status(monkeypatch):
     handler, statuses, _ = _streaming_handler(monkeypatch, fake_open)
     handler.do_POST()
     assert statuses == [429], statuses
+
+
+def test_stream_tool_use_live_when_client_coerces(monkeypatch):
+    """X-Cloak-Tool-Args: raw (soul-proxy/Hermes): tool arg deltas pass through
+    live with the uncloaked name, not held until content_block_stop."""
+    tools = [{"name": "read", "input_schema": {"type": "object", "properties": {
+        "offset": {"description": "line offset"}}}}]
+    cloaked_name = cloaked._cloaked_tool_name("read")
+    chunks = [
+        _sse("message_start", {"type": "message_start", "message": {"model": "claude-opus-5", "content": []}}),
+        _sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "tool_use", "id": "tu1", "name": cloaked_name, "input": {}}}),
+        _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "input_json_delta", "partial_json": '{"offs'}}),
+        _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "input_json_delta", "partial_json": 'et": "505"}'}}),
+        _sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        _sse("message_stop", {"type": "message_stop"}),
+    ]
+    handler, _, _ = _streaming_handler(monkeypatch, lambda b: _StreamResp(chunks), tools=tools,
+                                       headers={"X-Cloak-Tool-Args": "raw"})
+    handler.do_POST()
+    evs = _events(handler.wfile.buf)
+    assert next(d for e, d in evs if e == "content_block_start")["content_block"]["name"] == "read"
+    deltas = [d["delta"]["partial_json"] for e, d in evs if e == "content_block_delta"]
+    assert deltas == ['{"offs', 'et": "505"}']

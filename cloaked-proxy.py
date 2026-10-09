@@ -907,7 +907,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise
             with resp:
                 if want_stream:
-                    self._relay_stream(resp, tool_map, tool_schemas)
+                    live_tools = self.headers.get("X-Cloak-Tool-Args", "").lower() == "raw"
+                    self._relay_stream(resp, tool_map, tool_schemas, live_tools=live_tools)
                 else:
                     self._send_message_response(resp, tool_map, tool_schemas)
         except UpstreamHTTPError as e:
@@ -949,14 +950,19 @@ class Handler(BaseHTTPRequestHandler):
                    json.dumps((schema or {}).get("properties", {})), before,
                    json.dumps(block.get("input")), mode))
 
-    def _relay_stream(self, resp, tool_map: dict, tool_schemas: dict) -> None:
+    def _relay_stream(self, resp, tool_map: dict, tool_schemas: dict, live_tools: bool = False) -> None:
         """Pass upstream SSE through event by event.
 
-        Every event is forwarded as it arrives except tool_use blocks, which
-        are held from content_block_start to content_block_stop, then
-        re-emitted as start (uncloaked name) + one input_json_delta (coerced
-        args) + stop. An upstream failure after the 200 is committed becomes
-        an SSE ``error`` event (see _send_json)."""
+        Default: tool_use blocks are held from content_block_start to
+        content_block_stop, then re-emitted as start (uncloaked name) + one
+        input_json_delta (coerced args) + stop -- strict clients (OpenCode on
+        :8318) need coerced args. With ``live_tools`` (header
+        ``X-Cloak-Tool-Args: raw``, sent by soul-proxy for Hermes, which
+        coerces args itself in tools/arg_coercion.py) the block start is
+        uncloaked and its argument deltas pass through live: a long tool call
+        (a big write_file / heredoc) otherwise shows minutes of stream
+        silence. An upstream failure after the 200 is committed becomes an
+        SSE ``error`` event (see _send_json)."""
         by_hs = self._schema_index(tool_map, tool_schemas)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -992,6 +998,11 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             idx = obj.get("index")
             if ev == "content_block_start" and obj.get("content_block", {}).get("type") == "tool_use":
+                if live_tools:
+                    cb = obj["content_block"]
+                    cb["name"] = tool_map.get(cb.get("name", ""), None) or _uncloak_tool_name(cb.get("name", ""))
+                    emit(ev, obj)
+                    continue
                 held[idx] = {"block": dict(obj["content_block"]), "json": []}
                 continue
             if idx in held:

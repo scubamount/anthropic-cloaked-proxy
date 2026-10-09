@@ -255,6 +255,9 @@ class Handler(BaseHTTPRequestHandler):
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": self.headers.get("User-Agent", "hermes"),
+                # Hermes coerces tool args itself; let cloaked-proxy stream
+                # tool_use argument deltas live instead of buffering each block.
+                "X-Cloak-Tool-Args": "raw",
             },
         )
 
