@@ -114,6 +114,7 @@ CC_DESC = {
 # Model context limits (from platform.claude.com/docs/en/about-claude/models/overview)
 MODEL_CONTEXT = {
     "claude-sonnet-5-5": 1000000,
+    "claude-haiku-5-5": 200000,
     "claude-opus-5-5": 1000000,
     "claude-opus-5": 1000000,
     "claude-opus-4-8": 1000000,
@@ -135,6 +136,7 @@ MODEL_CONTEXT = {
 LISTED_MODELS = (
     "claude-opus-5-5",
     "claude-sonnet-5-5",
+    "claude-haiku-5-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-6",
